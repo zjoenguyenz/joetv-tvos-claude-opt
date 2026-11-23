@@ -671,7 +671,8 @@ final class JoeCinemaBackdropController: ObservableObject {
         defer { backdropTask.cancel(); hedgeTask.cancel() }
         while !box.settled {
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the box.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
         if let win = box.winner {
             return (win.image, win.source)
@@ -768,6 +769,9 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
     private var posterClaimed = false
     private var backdropDone = false
     private var posterDone: Bool
+    /// Wakes loadBackdrop's wait loop whenever the settled
+    /// state can have changed (claude/opt-1).
+    let wake = JoeWake()
 
     init(posterLegExists: Bool) {
         posterDone = !posterLegExists
@@ -779,6 +783,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         if leg == .backdrop { backdropDone = true }
         if leg == .poster { posterDone = true }
         lock.unlock()
+        wake.signal()
     }
 
     /// The backdrop leg finished with NO bitmap. Its
@@ -790,6 +795,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         backdropDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// The CLAIMED poster leg finished with NO bitmap
@@ -800,6 +806,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         posterDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// True exactly once — for the leg that runs the

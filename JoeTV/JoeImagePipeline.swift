@@ -807,7 +807,9 @@ struct JoeRemoteImage<Placeholder: View>: View {
         defer { hedge.cancel(); primary.cancel() }
         while !box.settled {
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the
+            // box the moment a leg publishes.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
         if let win = box.winner {
             logResolve(leg: win.leg, source: win.source, image: win.image)
@@ -908,6 +910,9 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
     private var primaryDone = false
     private var fallbackDone = false
     private var fbSource: URL?
+    /// Wakes resolve()'s wait loop whenever the box's
+    /// settled state can have changed (claude/opt-1).
+    let wake = JoeWake()
 
     func complete(image: UIImage, leg: String, source: URL?) {
         lock.lock()
@@ -915,6 +920,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         if leg == "primary" { primaryDone = true }
         if leg == "fallback" { fallbackDone = true }
         lock.unlock()
+        wake.signal()
     }
 
     /// The primary leg finished with NO accepted bitmap
@@ -928,6 +934,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         lock.lock()
         primaryDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// The CLAIMED fallback leg finished with NO accepted
@@ -938,6 +945,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         lock.lock()
         fallbackDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// True exactly once — for the leg that runs the

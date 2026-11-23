@@ -796,11 +796,16 @@ enum Providers {
         private let lock = NSLock()
         private var found: [String: String] = [:]
         private var finished = false
+        /// Wakes findAlternatives' wait loop when the search
+        /// finishes (claude/opt-1). update() does not signal:
+        /// the loop only ever acts on isFinished.
+        let wake = JoeWake()
         func update(_ f: [String: String]) {
             lock.lock(); found = f; lock.unlock()
         }
         func finish(_ f: [String: String]) {
             lock.lock(); found = f; finished = true; lock.unlock()
+            wake.signal()
         }
         var isFinished: Bool {
             lock.lock(); defer { lock.unlock() }; return finished
@@ -885,7 +890,10 @@ enum Providers {
         let start = Date()
         while !box.isFinished && !Task.isCancelled
                 && Date().timeIntervalSince(start) < 12 {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            // claude/opt-1: same 100 ms ceiling (the 12 s
+            // deadline is still checked at that cadence), woken
+            // early by finish().
+            await box.wake.nap(nanoseconds: 100_000_000)
         }
         let completed = box.isFinished
         if !completed { search.cancel() }
