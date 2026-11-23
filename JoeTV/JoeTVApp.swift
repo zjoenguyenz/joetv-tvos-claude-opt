@@ -658,6 +658,11 @@ struct JoeRootView: View {
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .focusSection()
+                    // claude/opt-2 (FL-448 / Fault 6): INSTRUMENTATION
+                    // ONLY — logs an off-canvas content width
+                    // (JoePCWidthProbe); no geometry changes.
+                    .background(JoePCWidthProbe(surface: "content",
+                                                section: nav.section.rawValue))
                 // FIX-214 (Finding 12): while search is
                 // open the BAR cannot take focus (the
                 // 2.1.3 nesting: the shell stayed focusable
@@ -671,6 +676,8 @@ struct JoeRootView: View {
                 // the bar's pills go inert.
                 topBar
                     .disabled(nav.searchOpen)
+                    .background(JoePCWidthProbe(surface: "bar",
+                                                section: nav.section.rawValue))
             }
         } else {
             VStack(spacing: 32) {
@@ -1191,6 +1198,43 @@ struct JoeRootView: View {
 /// depends on it. v2.0.0 (UI-5): theme tokens — selected or
 /// focused wears the theme accent fill, focus adds the theme
 /// ring; NO scale (construction law).
+/// claude/opt-2 (FL-448 Fault 1 + Fault 6): INSTRUMENTATION
+/// ONLY. Candidate mechanism for the horizontal-only stretch
+/// on Private Cinema compositions: the PC shell is one
+/// ZStack holding the section content and the bar, and the
+/// content's .frame(maxWidth: .infinity) does not cap a
+/// child that insists on more than the proposed width. One
+/// over-wide child therefore widens the content frame and the
+/// shared ZStack, the shell centres it (corners fall off BOTH
+/// edges), and the bar, sized to that ZStack, spreads its
+/// wordmark and clock off-screen while the nav stays centred;
+/// vertical geometry is untouched. This probe paints nothing
+/// and changes no layout (a clear background GeometryReader);
+/// it writes ONE diagnostic line per off-canvas width change,
+/// so the next device run convicts or clears the mechanism.
+private struct JoePCWidthProbe: View {
+    let surface: String
+    let section: String
+
+    var body: some View {
+        GeometryReader { geo in
+            Color.clear
+                .onAppear { report(geo.size.width) }
+                .onChange(of: geo.size.width) { _, width in report(width) }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func report(_ width: CGFloat) {
+        // Inside the tvOS safe area the shell expects 1760;
+        // the full 1920 canvas is also legitimate. Anything
+        // wider than the canvas is the convicting reading.
+        guard width > 1921 else { return }
+        DiagLog.write("LAYOUT", "PC \(surface) width=\(Int(width.rounded())) section=\(section) (canvas 1920)")
+    }
+}
+
 private struct PillLabel: View {
     let title: String
     let icon: String
