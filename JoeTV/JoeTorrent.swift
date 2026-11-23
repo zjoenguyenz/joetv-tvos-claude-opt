@@ -2308,20 +2308,22 @@ struct JoeTorrentDetail: View {
                                 .font(theme.id == .privateCinema
                                       ? JoePCType.outfit(25, weight: selected ? .semibold : .medium)
                                       : .system(size: 25, weight: selected ? .semibold : .medium))
-                                .foregroundStyle(selected ? theme.onAccent : theme.text)
+                                .foregroundStyle(selected && !rowFocused ? theme.onAccent : theme.text)
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 12)
+                                // claude/opt-2 (FL-422): selected
+                                // fill only while NOT focused.
                                 .background(RoundedRectangle(cornerRadius: theme.rField)
-                                    .fill(selected ? theme.accent
+                                    .fill(selected && !rowFocused ? theme.accent
                                           : theme.surface2))
                                 .overlay(RoundedRectangle(cornerRadius: theme.rField)
                                     .strokeBorder(rowFocused
                                                   && theme.id != .privateCinema
                                                   ? (theme.id == .posterWall && selected
                                                      ? Color.white : theme.focus)
-                                                  : (selected ? .clear : theme.stroke),
+                                                  : (selected && !rowFocused ? .clear : theme.stroke),
                                                   lineWidth: rowFocused
                                                     && theme.id != .privateCinema
                                                     ? theme.ringWidth : 1.5))

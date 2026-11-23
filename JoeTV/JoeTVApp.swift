@@ -1217,10 +1217,13 @@ private struct PillLabel: View {
         // box-shadow: none), so the ring is an explicit
         // strokeBorder in the JoeChipLabel form, not
         // JoeFocusRing (which paints clear at rest).
-        .foregroundStyle(selected ? theme.onAccent : theme.text)
+        // claude/opt-2 (FL-422): the selected fill is suppressed while
+        // focused (PCNavLabel's selected && !isFocused rule), so
+        // focus is ring-only on a selected item too.
+        .foregroundStyle(selected && !isFocused ? theme.onAccent : theme.text)
         .padding(.horizontal, 30)
         .padding(.vertical, 15)
-        .background(Capsule().fill(selected ? theme.accent : theme.surface2))
+        .background(Capsule().fill(selected && !isFocused ? theme.accent : theme.surface2))
         .overlay(Capsule().strokeBorder(
             isFocused
                 ? (theme.id == .posterWall && selected

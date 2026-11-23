@@ -1608,8 +1608,10 @@ private struct PCCategoryRowLabel: View {
         // already did) — the approved demo draws the row
         // [SIDE, SIDE+390], not 440.
         .frame(width: 390, alignment: .leading)
+        // claude/opt-2 (FL-422): the selected Panel face only
+        // while NOT focused — focus is the ivory outset ring.
         .background(RoundedRectangle(cornerRadius: 14)
-            .fill(selected ? theme.surface2 : Color.clear))
+            .fill(selected && !isFocused ? theme.surface2 : Color.clear))
         // Fault 11 fix round: the drawn Settings rail focus
         // is an ivory OUTSET outline around the row (the
         // build-Settings render's focused "Giao diện" row),

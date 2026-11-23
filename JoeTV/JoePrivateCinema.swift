@@ -163,7 +163,7 @@ struct PCNavLabel: View {
                     .font(.system(size: 20))
             }
             Text(title)
-                .font(JoePCType.outfit(24))
+                .font(JoePCType.outfit(24, weight: selected ? .semibold : .regular))
         }
         // FIX-214 (owner ruling 2026-11-22 14:46 CST —
         // Chỉ thị 10): menu focus is the RING ONLY. While
@@ -178,13 +178,18 @@ struct PCNavLabel: View {
         // selected + focused item wore fill AND ring
         // while its neighbour wore ring only — the
         // desync in the owner's clip.)
-        .foregroundStyle(selected && !isFocused ? theme.bg : theme.text)
+        // claude/opt-2 (FL-422, owner ruling): the nav fill is
+        // GONE at every state — no ivory capsule, selected or
+        // not, focused or not. Selected is carried by the text
+        // alone (semibold, see the font below); focus stays the
+        // celadon ring + scale. The 13 × 27 padding is kept so
+        // the ring's geometry and the bar's spacing are
+        // unchanged.
+        .foregroundStyle(theme.text)
         .lineLimit(1)
         .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 27)
         .padding(.vertical, 13)
-        .background(Capsule().fill(selected && !isFocused
-                                   ? theme.text : Color.clear))
         .overlay {
             if isFocused {
                 Capsule()
