@@ -252,6 +252,36 @@ enum Providers {
     /// run to one space, trim. "Siêu Nhân Tiga!" and "sieu nhan
     /// tiga" normalize equal.
     static func normalizeTitle(_ s: String) -> String {
+        // claude/opt-2 (FL-447 R1): memoised. This is a pure
+        // function of its input, and the Private Cinema
+        // homes' railSpecs dedupe calls it twice per movie
+        // per build, dozens of builds per focus step. The
+        // memo is keyed by the NSString form, whose equality
+        // is literal (stricter than Swift's canonical String
+        // equality), so a hit can only ever return the value
+        // this same input computed. NSCache is thread-safe
+        // and evicts under memory pressure.
+        let key = s as NSString
+        if let hit = normalizeTitleMemo.object(forKey: key) {
+            return hit as String
+        }
+        let out = normalizeTitleUncached(s)
+        normalizeTitleMemo.setObject(out as NSString, forKey: key)
+        return out
+    }
+
+    /// Swift 6: nonisolated(unsafe) — NSCache is internally
+    /// synchronised (thread-safe by design), exactly as the
+    /// image pipeline's decoded cache relies on.
+    private nonisolated(unsafe) static let normalizeTitleMemo:
+        NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 8192
+        return cache
+    }()
+
+    /// The pre-opt-2 normalizeTitle body, verbatim.
+    private static func normalizeTitleUncached(_ s: String) -> String {
         var n = s.folding(options: .diacriticInsensitive, locale: nil)
         n = n.replacingOccurrences(of: "đ", with: "d")
             .replacingOccurrences(of: "Đ", with: "d")
