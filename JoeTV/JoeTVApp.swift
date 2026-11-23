@@ -223,19 +223,6 @@ final class JoeNavigator: ObservableObject {
     // ENTRY policy (the pill row's entry is the pill the user
     // left — see the pillFocus note in JoeRootView). The hub
     // stays removed and law D4 stands unchanged.
-
-    /// Close the topmost layer; returns false when nothing is
-    /// open (the caller then lets the system have the press).
-    func closeTop() -> Bool {
-        if ytSignInOpen { ytSignInOpen = false; return true }
-        if ytPlayer != nil { ytPlayer = nil; return true }
-        if addonDetail != nil { addonDetail = nil; return true }
-        if ytDetail != nil { ytDetail = nil; return true }
-        if movie != nil { movie = nil; return true }
-        if tor != nil { tor = nil; return true }
-        if searchOpen { searchOpen = false; return true }
-        return false
-    }
 }
 
 /// The shell (v1.4 rework): a single VStack — topBar (wordmark +

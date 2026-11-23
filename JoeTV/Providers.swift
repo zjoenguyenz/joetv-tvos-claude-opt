@@ -222,8 +222,6 @@ enum Providers {
         return parseList(code, req, try await fetchListRaw(code, req))
     }
 
-    static func kkGenre(_ slug: String, page: Int) async throws -> [Movie] { try await KkClient.listByGenre(slug, page: page) }
-
     static func kkCountry(_ slug: String, page: Int) async throws -> [Movie] { try await KkClient.listByCountry(slug, page: page) }
 
     static func kkCountry(_ slug: String, page: Int, limit: Int) async throws -> [Movie] { try await KkClient.listByCountry(slug, page: page, limit: limit) }
