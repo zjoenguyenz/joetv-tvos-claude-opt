@@ -97,6 +97,63 @@ extension View {
     }
 }
 
+/// claude/opt-2 (FL-427, pinned state): the band cover for a
+/// Private Cinema home's pinned context strip.
+///
+/// Mechanism of the fault: joePCBarInset reserves the bar's
+/// height with a CLEAR safeAreaInset, and a scroll view's
+/// content keeps scrolling UNDER its insets. Once the strip
+/// pins, the rails therefore slide up behind the transparent
+/// bar and through any gap above the strip, so rail titles
+/// paint over whatever is behind (the poster backdrop). The
+/// deep-state drawing (RECALC-SPEC §3.0 / §3.1 "Trạng thái
+/// sâu"; TRIAL-Home-recalc-deep.png, measured: y0–131 flat
+/// Ink #0C1215, strip y132–219 Ink) has NOTHING above the
+/// strip but flat Ink under the bar's own text.
+///
+/// The cover is paint only (no state, no preference writes,
+/// so no layout feedback): a GeometryReader in the strip's
+/// background reads the strip's global frame; while the strip
+/// sits at the pinned position (its top within the band
+/// threshold below — the rest position is the hero stage's
+/// foot, 560/600, far below it) it paints theme.bg (Ink) from
+/// the screen's top edge down to the strip's bottom, across
+/// the full 1920 canvas. The shell draws the bar ABOVE the
+/// content, so the wordmark, nav and clock stay on top. At
+/// rest it paints nothing, so the hero/backdrop at rest is
+/// untouched.
+let joePCPinnedStripThreshold: CGFloat = 330
+
+private struct JoePCPinnedBandCover: ViewModifier {
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.background(alignment: .topLeading) {
+                GeometryReader { geo in
+                    let frame = geo.frame(in: .global)
+                    let pinned = frame.minY <= joePCPinnedStripThreshold
+                    let above = max(0, frame.minY)
+                    theme.bg
+                        .frame(width: 1920,
+                               height: pinned ? above + frame.height : 0)
+                        .offset(x: -frame.minX, y: -above)
+                        .allowsHitTesting(false)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPinnedBandCover() -> some View {
+        modifier(JoePCPinnedBandCover())
+    }
+}
+
 // MARK: - Design top bar pieces (FIX-213, Fault 8)
 //
 // The Private Cinema design set's own header (measured

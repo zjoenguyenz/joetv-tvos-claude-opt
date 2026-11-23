@@ -203,6 +203,9 @@ struct JoeTorrentHome: View {
                                 favRail
                             } header: {
                                 torContextStrip
+                                    // claude/opt-2 (FL-427): Ink
+                                    // above the strip while pinned.
+                                    .joePCPinnedBandCover()
                             }
                             // v2.1.1 (WS-I; FIX-6): the
                             // rails' Section sits on plain

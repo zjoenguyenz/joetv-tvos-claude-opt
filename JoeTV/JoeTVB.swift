@@ -732,6 +732,9 @@ struct JoeTVBView: View {
                         pcAppendSections(catalog)
                     } header: {
                         tvbContextStrip(catalog)
+                            // claude/opt-2 (FL-427): Ink above
+                            // the strip while it is pinned.
+                            .joePCPinnedBandCover()
                     }
                     .background(theme.bg)
                 } else if loadFailed {

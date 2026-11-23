@@ -621,6 +621,9 @@ struct JoeHomeScreen: View {
                 }
                 } header: {
                     cinemaContextStrip
+                        // claude/opt-2 (FL-427): Ink above the
+                        // strip while it is pinned.
+                        .joePCPinnedBandCover()
                 }
                 if catalogueEmpty && phim.loading && !phim.loadTimedOut {
                     ProgressView("Đang tải thư viện phim…")
