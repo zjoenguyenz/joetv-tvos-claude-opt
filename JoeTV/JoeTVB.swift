@@ -2383,7 +2383,14 @@ struct JoeTVBSearchView: View {
                     ytResultsGrid
                 }
             }
+            // claude/opt-2 (owner: focus frames cut at the
+            // edge): inset 16 + scroll widened 16, horizontally
+            // only, so the outermost card's ring + scale fit
+            // inside the clip (net geometry 0; the v2.0.16
+            // vertical clip rule below stands).
+            .padding(.horizontal, 16)
         }
+        .padding(.horizontal, -16)
         // v2.0.16: CLIPS at its frame, like the JoeSearch
         // grid it was templated from — this copy kept the
         // .scrollClipDisabled() the search fix removed, so
