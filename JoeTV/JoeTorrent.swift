@@ -1352,7 +1352,11 @@ struct JoeTorrentHome: View {
         .padding(.trailing, 14)
         .frame(height: 88)
         .frame(maxWidth: .infinity)
-        .background(theme.bg)
+        // claude/opt-2 (owner: glass bar, not a black bar over
+        // the full-screen backdrop): JoeCinemaGlass, drawn edge
+        // to edge (background only, -80 over the safe-area inset;
+        // no layout change).
+        .background { JoeCinemaGlass().padding(.horizontal, -80) }
     }
 
     /// The strip's content for the torrent home: resolve

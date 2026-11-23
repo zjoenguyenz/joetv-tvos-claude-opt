@@ -122,6 +122,28 @@ extension View {
 /// content, so the wordmark, nav and clock stay on top. At
 /// rest it paints nothing, so the hero/backdrop at rest is
 /// untouched.
+/// claude/opt-2 (owner, 2026-11-22: "backdrop bị 1 thanh
+/// ngang màu đen … làm theo dạng thanh kính để không bị
+/// che"): the Private Cinema context strip and the pinned
+/// band above it are GLASS, not opaque Ink. Once the backdrop
+/// became full screen (FL-457) the opaque 88 pt strip read as
+/// a black bar laid across the art. The glass is the system
+/// ultra-thin material (frosted: the art stays visible, rail
+/// text behind it is blurred illegible) under a light Ink
+/// tint for the strip's own text. One definition for the four
+/// homes' strips and the pinned band cover. Paint only.
+struct JoeCinemaGlass: View {
+    @Environment(\.joeTheme) private var theme
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.ultraThinMaterial)
+            theme.bg.opacity(0.35)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
 let joePCPinnedStripThreshold: CGFloat = 330
 
 private struct JoePCPinnedBandCover: ViewModifier {
@@ -135,7 +157,8 @@ private struct JoePCPinnedBandCover: ViewModifier {
                     let frame = geo.frame(in: .global)
                     let pinned = frame.minY <= joePCPinnedStripThreshold
                     let above = max(0, frame.minY)
-                    theme.bg
+                    // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
+                    JoeCinemaGlass()
                         .frame(width: 1920,
                                height: pinned ? above + frame.height : 0)
                         .offset(x: -frame.minX, y: -above)
