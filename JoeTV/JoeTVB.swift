@@ -1669,7 +1669,32 @@ struct JoeTVBView: View {
     /// displayed titles), then the seven genre shelves in
     /// audit order. A rail renders only when it resolves to
     /// at least one displayed title.
+    /// claude/opt-2 (FL-447 R4): railSpecs(catalog) is a pure
+    /// function of the catalogue, and `catalog` is assigned
+    /// exactly once (loadCatalog's guard), yet the strip, the
+    /// tagline, the rails and the focus handler each rebuilt
+    /// it — decade grouping, four sorts and an actor index
+    /// over every displayed title — about seven times per
+    /// focus step. The first build is kept here and returned
+    /// while the catalogue key still matches. A reference
+    /// box, so filling it inside body is not a state write.
+    private final class RailSpecsMemo {
+        var key: String?
+        var specs: [RailSpec] = []
+    }
+    @State private var railSpecsMemo = RailSpecsMemo()
+
     private func railSpecs(_ catalog: TVBCatalog) -> [RailSpec] {
+        let key = "\(catalog.version)|\(catalog.generatedAt)|\(catalog.titles.count)"
+        if railSpecsMemo.key == key { return railSpecsMemo.specs }
+        let built = buildRailSpecs(catalog)
+        railSpecsMemo.key = key
+        railSpecsMemo.specs = built
+        return built
+    }
+
+    /// The pre-opt-2 railSpecs body, verbatim.
+    private func buildRailSpecs(_ catalog: TVBCatalog) -> [RailSpec] {
         var specs = [
             RailSpec(scope: "dangHot", title: "🔥 Đang hot",
                      ids: catalog.rails.dangHot),
