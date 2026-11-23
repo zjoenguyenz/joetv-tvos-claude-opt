@@ -1726,11 +1726,21 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
     let hasNextEpisode: Bool
     let onNextEpisode: () -> Void
 
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
         controller.showsPlaybackControls = true
-        applyMenuItems(to: controller)
+        // opt-2 (Back fix): delegate only to LOG the
+        // transport bar's announced visibility, so the next
+        // owner log shows whether a Menu press was spent by
+        // AVKit hiding its own bar. The delegate answers
+        // nothing else (no other delegate method is
+        // implemented), so AVKit's behaviour is unchanged.
+        controller.delegate = context.coordinator
+        context.coordinator.onNextEpisode = onNextEpisode
+        applyMenuItems(to: controller, coordinator: context.coordinator)
         return controller
     }
 
@@ -1739,19 +1749,66 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         if controller.player !== player {
             controller.player = player
         }
-        applyMenuItems(to: controller)
+        context.coordinator.onNextEpisode = onNextEpisode
+        applyMenuItems(to: controller, coordinator: context.coordinator)
     }
 
-    private func applyMenuItems(to controller: AVPlayerViewController) {
+    /// opt-2 (Back fix, owner 2026-11-22: "mở tvb phim
+    /// chạy thì sẽ không bấm được nút back, bấm 3-4 lần nó
+    /// mới work"): pre-fix this re-ASSIGNED a brand-new
+    /// `[UIAction]` to transportBarCustomMenuItems on EVERY
+    /// SwiftUI update of the player view — each phase flip,
+    /// each status-pill flash/clear, each WatchStore
+    /// progress publish (the view observes WatchStore) —
+    /// i.e. several AVKit transport-bar rebuilds in the
+    /// first seconds of every episode, exactly the window
+    /// in which the owner's Menu presses went unanswered.
+    /// The normal-film AVPlayerViewController host (whose
+    /// update is empty) never does this, and its Back is
+    /// device-proven. Now the items are assigned only when
+    /// the item's PRESENCE changes; the action calls
+    /// through the coordinator, so it always runs the
+    /// latest closure. Same bar, same title, same action.
+    private func applyMenuItems(to controller: AVPlayerViewController,
+                                coordinator: Coordinator) {
+        guard coordinator.appliedHasNext != hasNextEpisode else { return }
+        coordinator.appliedHasNext = hasNextEpisode
         if hasNextEpisode {
             controller.transportBarCustomMenuItems = [
-                UIAction(title: "Tập tiếp theo") { _ in onNextEpisode() }
+                UIAction(title: "Tập tiếp theo") { [weak coordinator] _ in
+                    // UIKit runs action handlers on main;
+                    // assumeIsolated states that for the
+                    // @MainActor coordinator under Swift 6.
+                    MainActor.assumeIsolated {
+                        coordinator?.onNextEpisode?()
+                    }
+                }
             ]
         } else if !controller.transportBarCustomMenuItems.isEmpty {
             controller.transportBarCustomMenuItems = []
         }
     }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        /// nil = nothing assigned yet (first apply always runs).
+        var appliedHasNext: Bool?
+        var onNextEpisode: (() -> Void)?
+
+        func playerViewController(
+            _ playerViewController: AVPlayerViewController,
+            willTransitionToVisibilityOfTransportBar visible: Bool,
+            with _: AVPlayerViewControllerAnimationCoordinator
+        ) {
+            DiagLog.write("YT-PLAY", "transport bar \(visible ? "hiện" : "ẩn")")
+        }
+    }
 }
+
+/// Swift 6: the same SE-0470 main-actor isolated
+/// conformance PlayerController.Coordinator uses (see the
+/// note there) — AVKit calls the delegate on main only.
+extension JoeYtPlayerControllerView.Coordinator: @MainActor AVPlayerViewControllerDelegate {}
 
 // MARK: - Player view
 
@@ -1815,6 +1872,11 @@ struct JoeYtNativePlayerView: View {
         .onExitCommand {
             if model.phase == .ended {
                 DiagLog.write("YT-PLAY", "slate end — về detail (trigger=menu)")
+            } else {
+                // opt-2: the exit itself was never logged —
+                // the 2026-11-22 owner log could not show
+                // which press finally reached this handler.
+                DiagLog.write("YT-PLAY", "menu → đóng player (trigger=menu)")
             }
             nav.ytPlayer = nil
         }
