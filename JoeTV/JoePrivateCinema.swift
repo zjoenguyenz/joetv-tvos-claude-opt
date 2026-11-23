@@ -132,13 +132,28 @@ extension View {
 /// text behind it is blurred illegible) under a light Ink
 /// tint for the strip's own text. One definition for the four
 /// homes' strips and the pinned band cover. Paint only.
+///
+/// claude/opt-2 (owner log 2026-11-22: "lag 1 chút xíu so với
+/// cái cũ"): a live material blur re-samples everything
+/// behind it on every frame. At rest nothing moves behind the
+/// strip, so the strip itself is a plain tinted glass
+/// (`frosted: false`, no blur, Ink 0.5). The frosted material
+/// is used ONLY by the pinned band cover, which paints solely
+/// while the strip is pinned and rails scroll beneath it; it
+/// covers the strip's own area too, so the pinned strip reads
+/// as frosted glass and rail text behind it stays illegible.
 struct JoeCinemaGlass: View {
+    var frosted: Bool = false
     @Environment(\.joeTheme) private var theme
 
     var body: some View {
         ZStack {
-            Rectangle().fill(.ultraThinMaterial)
-            theme.bg.opacity(0.35)
+            if frosted {
+                Rectangle().fill(.ultraThinMaterial)
+                theme.bg.opacity(0.35)
+            } else {
+                theme.bg.opacity(0.5)
+            }
         }
         .allowsHitTesting(false)
     }
@@ -158,7 +173,7 @@ private struct JoePCPinnedBandCover: ViewModifier {
                     let pinned = frame.minY <= joePCPinnedStripThreshold
                     let above = max(0, frame.minY)
                     // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
-                    JoeCinemaGlass()
+                    JoeCinemaGlass(frosted: true)
                         .frame(width: 1920,
                                height: pinned ? above + frame.height : 0)
                         .offset(x: -frame.minX, y: -above)
@@ -1016,6 +1031,15 @@ struct JoeCinemaPageBackdrop: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()
+        // claude/opt-2 (owner log 2026-11-22, lag vs 2.1.4):
+        // the full-screen backdrop now sits under the rails
+        // the whole time you browse, so every scroll frame
+        // re-blended the bitmap(s) + two full-screen gradients.
+        // drawingGroup flattens the stack into ONE offscreen-
+        // rendered layer that is redrawn only when its content
+        // changes (a new backdrop / the crossfade), not per
+        // scroll frame. Same pixels.
+        .drawingGroup()
         .clipped()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
