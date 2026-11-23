@@ -1032,11 +1032,26 @@ struct JoeSettingsFieldChrome: ViewModifier {
             .padding(.trailing, filled ? 48 : 0)
             .background(RoundedRectangle(cornerRadius: radius)
                 .fill(theme.fieldBar))
+            // claude/opt-2 (FL-423, Ruling 22): under Private
+            // Cinema the Settings field is the drawing's
+            // SINGLE-layer bar — fieldBar #22312E, rField 12,
+            // the ✓ bare inside it — with NO frame of its own.
+            // Pre-fix it wore a 1.5 hairline at rest and, when
+            // focused, a celadon border on the bar's edge PLUS
+            // the celadon outline 6 pt outside it: the double
+            // frame the owner named ("khung thẻ của bản
+            // ultra"). Focus is now ONE celadon 2 pt stroke on
+            // the bar's own edge (the Ruling 17 on-the-bar
+            // form), nothing outside it. Every other theme's
+            // expression is unchanged (no border overlay; the
+            // shared JoeFieldFocusRing on the bar). The Search
+            // input keeps its own spec'd treatment in
+            // JoeFieldChrome (RECALC-SPEC §3.8), untouched.
             .overlay(RoundedRectangle(cornerRadius: radius)
-                .strokeBorder(pc ? (focused ? theme.accent2 : theme.stroke)
-                                 : .clear,
-                              lineWidth: pc ? 1.5 : 0))
-            .overlay(JoeFieldFocusRing(radius: radius, focused: focused))
+                .strokeBorder(pc && focused ? theme.accent2 : .clear,
+                              lineWidth: pc && focused ? 2 : 0))
+            .overlay(JoeFieldFocusRing(radius: radius,
+                                       focused: pc ? false : focused))
             .overlay(alignment: .trailing) {
                 if filled {
                     JoeSettingsFilledMark()
