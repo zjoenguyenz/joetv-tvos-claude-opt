@@ -252,6 +252,21 @@ enum JoeCinemaScrims {
 // stand-in — the compression then errs toward MORE air,
 // never toward the overlap this budget exists to kill).
 enum JoeHeroMeasure {
+    // claude/opt-2 (FL-447 R2): the hero bodies call these on
+    // every render — i.e. on every focus move — and each call
+    // did a UIFont(name:) lookup plus an NSString text layout.
+    // Both answers depend only on (text, face, size, width),
+    // and the bundled faces are registered once at launch
+    // (UIAppFonts), so the results are memoised. NSCache is
+    // thread-safe and evicts under memory pressure; a miss
+    // runs the original computation unchanged.
+    private nonisolated(unsafe) static let linesMemo: NSCache<NSString, NSNumber> = {
+        let cache = NSCache<NSString, NSNumber>()
+        cache.countLimit = 512
+        return cache
+    }()
+    private nonisolated(unsafe) static let lineHeightMemo = NSCache<NSString, NSNumber>()
+
     private static func font(_ postScriptName: String,
                              _ size: CGFloat) -> UIFont {
         UIFont(name: postScriptName, size: size)
@@ -263,17 +278,27 @@ enum JoeHeroMeasure {
     static func lines(of text: String, postScriptName: String,
                       size: CGFloat, width: CGFloat) -> Int {
         guard !text.isEmpty else { return 0 }
+        let key = "\(postScriptName)|\(size)|\(width)|\(text)" as NSString
+        if let hit = linesMemo.object(forKey: key) { return hit.intValue }
         let f = font(postScriptName, size)
         let rect = (text as NSString).boundingRect(
             with: CGSize(width: width, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: [.font: f], context: nil)
-        return max(1, Int(ceil(rect.height / f.lineHeight)))
+        let count = max(1, Int(ceil(rect.height / f.lineHeight)))
+        linesMemo.setObject(NSNumber(value: count), forKey: key)
+        return count
     }
 
     static func lineHeight(postScriptName: String,
                            size: CGFloat) -> CGFloat {
-        font(postScriptName, size).lineHeight
+        let key = "\(postScriptName)|\(size)" as NSString
+        if let hit = lineHeightMemo.object(forKey: key) {
+            return CGFloat(hit.doubleValue)
+        }
+        let height = font(postScriptName, size).lineHeight
+        lineHeightMemo.setObject(NSNumber(value: Double(height)), forKey: key)
+        return height
     }
 }
 
