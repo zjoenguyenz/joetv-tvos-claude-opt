@@ -207,13 +207,15 @@ struct JoeTorrentHome: View {
                                     // above the strip while pinned.
                                     .joePCPinnedBandCover()
                             }
-                            // v2.1.1 (WS-I; FIX-6): the
-                            // rails' Section sits on plain
-                            // Ink — the backdrop lives in
-                            // the hero block above the
-                            // Section, never under the
-                            // rails while browsing.
-                            .background(theme.bg)
+                            // claude/opt-2 (FL-457, owner
+                            // ruling): the Section's plain
+                            // Ink fill (v2.1.1 WS-I/FIX-6)
+                            // is removed — it cut the
+                            // full-screen page backdrop at
+                            // the hero's foot. The rails
+                            // now sit on the page scrim's
+                            // near-full Ink, as on Trang
+                            // chủ and Phim.
                             // FIX-213 (Fault 7): the
                             // design's bottom margin (64)
                             // — this shared stack's own
@@ -291,6 +293,9 @@ struct JoeTorrentHome: View {
                 .padding(.top, theme.id == .privateCinema ? -joePCBarHeight : 0)
             }
             .joePCBarInset()
+            // claude/opt-2 (FL-457): the full-screen backdrop behind
+            // the whole page (Private Cinema only; see JoePrivateCinema).
+            .joePCPageBackdrop(torBackdrop)
             // v2.1.1 (FIX-6): WS-I's ScrollView-background
             // backdrop placement is REMOVED — the shared
             // controller's layer now lives inside the PC
@@ -659,18 +664,19 @@ struct JoeTorrentHome: View {
     private var torHeroBlock: some View {
         if let resolved = torHeroDisplayResolved() {
             ZStack(alignment: .bottomLeading) {
-                JoeCinemaBackdropLayer(controller: torBackdrop)
+                // claude/opt-2 (FL-457): the stage is TEXT-ONLY — the
+                // backdrop and its scrims moved to page level
+                // (joePCPageBackdrop on the scroll view). This clear
+                // spacer keeps the stage's full-width frame, so the
+                // text, the tagline anchor and the strip below sit
+                // exactly where they did.
+                Color.clear
                     .frame(maxWidth: .infinity)
-                    // FIX-214 (DESIGN-PASS-214 §1a):
-                    // stage 485 → 560, as on the Phim hero.
                     .frame(height: 560)
-                    .clipped()
                 // FIX-214 (FULL-THEME-AUDIT-214 Phần C họ
                 // 1): the design's Ink scrims
                 // (JoeCinemaScrims), shared by all three
                 // heroes.
-                Rectangle().fill(JoeCinemaScrims.left)
-                Rectangle().fill(JoeCinemaScrims.bottom)
                 // FIX-213 (Fault 8): NO top scrim — the
                 // design draws exactly two scrims on this
                 // stage (left + bottom); the third one

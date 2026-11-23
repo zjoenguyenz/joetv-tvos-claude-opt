@@ -291,6 +291,26 @@ enum JoeCinemaScrims {
         ], startPoint: .leading, endPoint: .trailing)
     }
 
+    /// claude/opt-2 (FL-457, owner ruling): the vertical scrim
+    /// of the FULL-SCREEN page backdrop. The design's stage
+    /// ramp (`bottom` below) ended at 0x1F Ink on the stage's
+    /// foot, which is the hard cut the owner rejected once
+    /// the art runs the whole screen. This ramp takes the
+    /// melt of the theme's own full-screen detail backdrop
+    /// (JoeMovieDetail.cinemaBackdrop: clear by 0.35, bg 0.88
+    /// at 0.85, full bg at the bottom) so the rails sit on
+    /// near-full Ink. Its top stays CLEAR (not the detail's
+    /// 0.30): FIX-213 Fault 8 ruled out any top darkening of
+    /// the art under the bar ("Làm che luôn backdrop").
+    static var page: LinearGradient {
+        LinearGradient(stops: [
+            .init(color: ink.opacity(0), location: 0),
+            .init(color: ink.opacity(0), location: 0.35),
+            .init(color: ink.opacity(0.88), location: 0.85),
+            .init(color: ink.opacity(1), location: 1)
+        ], startPoint: .top, endPoint: .bottom)
+    }
+
     static var bottom: LinearGradient {
         LinearGradient(stops: [
             .init(color: ink.opacity(50.0 / 255.0), location: 0),
@@ -948,6 +968,58 @@ struct JoeCinemaBackdropLayer: View {
                     .opacity(controller.topOpacity)
             }
         }
+    }
+}
+
+/// claude/opt-2 (FL-457, owner ruling): the Private Cinema
+/// home's FULL-SCREEN backdrop. The owner's standard
+/// overrides RECALC-SPEC's confined hero stage: the art
+/// fills the whole screen like the original theme and like
+/// the detail backdrops. This is the same focus-follows
+/// controller and crossfade layer the hero stage carried,
+/// hoisted to page level BEHIND the home's ScrollView
+/// (mounted with .background, ignoring the safe area), under
+/// the design's left scrim and the full-height `page` ramp.
+/// The hero stage above it is now text-only at its unchanged
+/// 560/600 frame; the pinned strip keeps its opaque Ink.
+struct JoeCinemaPageBackdrop: View {
+    @ObservedObject var controller: JoeCinemaBackdropController
+
+    var body: some View {
+        ZStack {
+            JoeCinemaBackdropLayer(controller: controller)
+            Rectangle().fill(JoeCinemaScrims.left)
+            Rectangle().fill(JoeCinemaScrims.page)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .clipped()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Mounts JoeCinemaPageBackdrop behind a home's scroll view,
+/// Private Cinema only (other themes: unchanged).
+private struct JoePCPageBackdrop: ViewModifier {
+    @ObservedObject var controller: JoeCinemaBackdropController
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.background {
+                JoeCinemaPageBackdrop(controller: controller)
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPageBackdrop(_ controller: JoeCinemaBackdropController) -> some View {
+        modifier(JoePCPageBackdrop(controller: controller))
     }
 }
 

@@ -665,6 +665,9 @@ struct JoeHomeScreen: View {
             .padding(.bottom, 64)
         }
         .joePCBarInset()
+        // claude/opt-2 (FL-457): the full-screen backdrop behind
+        // the whole page (Private Cinema only; see JoePrivateCinema).
+        .joePCPageBackdrop(cinemaBackdrop)
         // v2.1.0 (Private Cinema): the Menu-to-top jump's
         // scroll hook, inside the reader — ultraHome's hook,
         // unchanged.
@@ -1804,10 +1807,15 @@ struct JoeHomeScreen: View {
                 // below still resolves the featured title's
                 // TMDB backdrop / detail / rating — the
                 // resolver reads them for the featured item.
-                JoeCinemaBackdropLayer(controller: cinemaBackdrop)
-                .frame(maxWidth: .infinity)
-                .frame(height: stage)
-                .clipped()
+                // claude/opt-2 (FL-457): the stage is TEXT-ONLY — the
+                // backdrop and its scrims moved to page level
+                // (joePCPageBackdrop on the scroll view). This clear
+                // spacer keeps the stage's full-width frame, so the
+                // text, the tagline anchor and the strip below sit
+                // exactly where they did.
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: stage)
                 // FIX-214 (FULL-THEME-AUDIT-214 Phần C họ
                 // 1): the design's TWO scrims — the Ink
                 // stop ramps (JoeCinemaScrims), shared by
@@ -1815,8 +1823,6 @@ struct JoeHomeScreen: View {
                 // five-stop BLACK left gradient + a
                 // clear→bg bottom ramp) was a different
                 // colour family from the drawing.
-                Rectangle().fill(JoeCinemaScrims.left)
-                Rectangle().fill(JoeCinemaScrims.bottom)
                 // FIX-213 (Fault 8): NO top scrim — the
                 // design draws exactly two scrims on this
                 // stage (left + bottom); the third one that
