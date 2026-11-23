@@ -152,7 +152,24 @@ struct JoeCinemaGlass: View {
                 Rectangle().fill(.ultraThinMaterial)
                 theme.bg.opacity(0.35)
             } else {
-                theme.bg.opacity(0.5)
+                // claude/opt-2 (owner 2026-11-22 23:08: "hiệu ứng
+                // gương khi đang ở trên rail đầu tiên, để nó không
+                // bị che hoàn toàn backdrop"): at rest the strip is
+                // a light MIRROR glass, not a tinted band — a faint
+                // Ink veil for the text, a soft sheen falling from
+                // the top edge and hairline edges top and bottom.
+                // The backdrop reads through it. The darker pinned
+                // look is painted by the pinned band cover instead
+                // (see JoePCPinnedBandCover), unchanged.
+                theme.bg.opacity(0.15)
+                LinearGradient(colors: [Color.white.opacity(0.08),
+                                        Color.white.opacity(0.0)],
+                               startPoint: .top, endPoint: .bottom)
+                VStack(spacing: 0) {
+                    Color.white.opacity(0.14).frame(height: 1)
+                    Spacer(minLength: 0)
+                    Color.white.opacity(0.10).frame(height: 1)
+                }
             }
         }
         .allowsHitTesting(false)
@@ -174,6 +191,13 @@ private struct JoePCPinnedBandCover: ViewModifier {
                     let above = max(0, frame.minY)
                     // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
                     JoeCinemaGlass(frosted: true)
+                        // claude/opt-2: when pinned, the strip's own
+                        // area keeps the darker look it had before
+                        // the mirror change (frosted + Ink 0.5).
+                        .overlay(alignment: .bottom) {
+                            theme.bg.opacity(pinned ? 0.5 : 0)
+                                .frame(height: frame.height)
+                        }
                         .frame(width: 1920,
                                height: pinned ? above + frame.height : 0)
                         .offset(x: -frame.minX, y: -above)
