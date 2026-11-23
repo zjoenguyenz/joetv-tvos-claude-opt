@@ -294,7 +294,9 @@ enum SourceHealth {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            try? await Task.sleep(nanoseconds: 25_000_000)
+            // claude/opt-1: the same 25 ms ceiling, but the box
+            // wakes this loop the moment an outcome lands.
+            await box.wake.nap(nanoseconds: 25_000_000)
         }
     }
 
@@ -586,28 +588,134 @@ private final class RunRaceBox<T>: @unchecked Sendable {
 
     private let lock = NSLock()
     private var result: Outcome?
+    /// Wakes SourceHealth.run's wait loop on publication
+    /// (claude/opt-1); the first-write-wins rule is unchanged.
+    let wake = JoeWake()
 
     func complete(_ value: T) {
         lock.lock()
         if result == nil { result = .value(value) }
         lock.unlock()
+        wake.signal()
     }
 
     func fail(_ error: Error) {
         lock.lock()
         if result == nil { result = .error(error) }
         lock.unlock()
+        wake.signal()
     }
 
     func expire() {
         lock.lock()
         if result == nil { result = .expired }
         lock.unlock()
+        wake.signal()
     }
 
     var outcome: Outcome? {
         lock.lock()
         defer { lock.unlock() }
         return result
+    }
+}
+
+/// Bounded wake-up for the race-wait loops (claude/opt-1,
+/// OPTIMIZATION-AUDIT item 1). The loops that wait on a
+/// first-write-wins box used to sleep a FIXED interval
+/// between checks, so an outcome that had already landed
+/// was noticed up to one interval late. `nap` is a drop-in
+/// for that sleep: it waits AT MOST the same interval, and
+/// returns early when the box's publisher calls `signal()`
+/// or the waiting task is cancelled. The loop around it is
+/// unchanged and re-checks everything after every nap, so
+/// the worst case is exactly the old fixed sleep and an
+/// early wake-up can only make the loop look sooner — never
+/// change what it finds (every box using this decides its
+/// winner at publication, not at the waiter's check).
+///
+/// One waiter per instance (each box has exactly one
+/// polling loop). A signal that arrives while nobody is
+/// napping is remembered (`pending`), so the next nap
+/// returns at once and no wake-up is ever lost.
+/// @unchecked Sendable — every stored property is touched
+/// only under `lock`; continuations are resumed outside it,
+/// each exactly once (whoever takes it out of `waiter`).
+final class JoeWake: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var waiterID: UInt64 = 0
+    private var issued: UInt64 = 0
+    private var expiredID: UInt64 = 0
+
+    /// The box published something: wake the napper now
+    /// (or make its next nap return at once).
+    func signal() {
+        let resume: CheckedContinuation<Void, Never>? = lock.withLock {
+            if let w = waiter {
+                waiter = nil
+                return w
+            }
+            pending = true
+            return nil
+        }
+        resume?.resume()
+    }
+
+    /// Sleep up to `nanoseconds`; return early on signal()
+    /// or cancellation.
+    func nap(nanoseconds: UInt64) async {
+        // Defensive: a second concurrent napper (not a use
+        // this type has) falls back to the plain sleep.
+        let busy: Bool = lock.withLock { waiter != nil }
+        if busy {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            return
+        }
+        let id: UInt64 = lock.withLock {
+            issued &+= 1
+            return issued
+        }
+        let timer = Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            if Task.isCancelled { return }
+            self?.expire(id)
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                let resumeNow: Bool = lock.withLock {
+                    if pending {
+                        pending = false
+                        return true
+                    }
+                    if expiredID == id || waiter != nil || Task.isCancelled {
+                        return true
+                    }
+                    waiter = c
+                    waiterID = id
+                    return false
+                }
+                if resumeNow { c.resume() }
+            }
+        } onCancel: {
+            self.expire(id)
+        }
+        timer.cancel()
+    }
+
+    /// The nap `id` is over (its interval elapsed or its task
+    /// was cancelled): resume it if it is parked, otherwise
+    /// mark it so it does not park at all.
+    private func expire(_ id: UInt64) {
+        let resume: CheckedContinuation<Void, Never>? = lock.withLock {
+            if let w = waiter, waiterID == id {
+                waiter = nil
+                return w
+            }
+            if id == issued { expiredID = id }
+            return nil
+        }
+        resume?.resume()
     }
 }

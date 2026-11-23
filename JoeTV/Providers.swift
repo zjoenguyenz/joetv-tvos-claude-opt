@@ -222,8 +222,6 @@ enum Providers {
         return parseList(code, req, try await fetchListRaw(code, req))
     }
 
-    static func kkGenre(_ slug: String, page: Int) async throws -> [Movie] { try await KkClient.listByGenre(slug, page: page) }
-
     static func kkCountry(_ slug: String, page: Int) async throws -> [Movie] { try await KkClient.listByCountry(slug, page: page) }
 
     static func kkCountry(_ slug: String, page: Int, limit: Int) async throws -> [Movie] { try await KkClient.listByCountry(slug, page: page, limit: limit) }
@@ -252,6 +250,36 @@ enum Providers {
     /// run to one space, trim. "Siêu Nhân Tiga!" and "sieu nhan
     /// tiga" normalize equal.
     static func normalizeTitle(_ s: String) -> String {
+        // claude/opt-2 (FL-447 R1): memoised. This is a pure
+        // function of its input, and the Private Cinema
+        // homes' railSpecs dedupe calls it twice per movie
+        // per build, dozens of builds per focus step. The
+        // memo is keyed by the NSString form, whose equality
+        // is literal (stricter than Swift's canonical String
+        // equality), so a hit can only ever return the value
+        // this same input computed. NSCache is thread-safe
+        // and evicts under memory pressure.
+        let key = s as NSString
+        if let hit = normalizeTitleMemo.object(forKey: key) {
+            return hit as String
+        }
+        let out = normalizeTitleUncached(s)
+        normalizeTitleMemo.setObject(out as NSString, forKey: key)
+        return out
+    }
+
+    /// Swift 6: nonisolated(unsafe) — NSCache is internally
+    /// synchronised (thread-safe by design), exactly as the
+    /// image pipeline's decoded cache relies on.
+    private nonisolated(unsafe) static let normalizeTitleMemo:
+        NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 8192
+        return cache
+    }()
+
+    /// The pre-opt-2 normalizeTitle body, verbatim.
+    private static func normalizeTitleUncached(_ s: String) -> String {
         var n = s.folding(options: .diacriticInsensitive, locale: nil)
         n = n.replacingOccurrences(of: "đ", with: "d")
             .replacingOccurrences(of: "Đ", with: "d")
@@ -796,11 +824,16 @@ enum Providers {
         private let lock = NSLock()
         private var found: [String: String] = [:]
         private var finished = false
+        /// Wakes findAlternatives' wait loop when the search
+        /// finishes (claude/opt-1). update() does not signal:
+        /// the loop only ever acts on isFinished.
+        let wake = JoeWake()
         func update(_ f: [String: String]) {
             lock.lock(); found = f; lock.unlock()
         }
         func finish(_ f: [String: String]) {
             lock.lock(); found = f; finished = true; lock.unlock()
+            wake.signal()
         }
         var isFinished: Bool {
             lock.lock(); defer { lock.unlock() }; return finished
@@ -885,7 +918,10 @@ enum Providers {
         let start = Date()
         while !box.isFinished && !Task.isCancelled
                 && Date().timeIntervalSince(start) < 12 {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            // claude/opt-1: same 100 ms ceiling (the 12 s
+            // deadline is still checked at that cadence), woken
+            // early by finish().
+            await box.wake.nap(nanoseconds: 100_000_000)
         }
         let completed = box.isFinished
         if !completed { search.cancel() }

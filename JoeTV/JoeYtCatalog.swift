@@ -299,6 +299,15 @@ struct JoeYtFile: Codable, Sendable {
     let series: [JoeYtSeries]
 }
 
+/// Just the stamp of a JoeYtFile (claude/opt-1,
+/// OPTIMIZATION-AUDIT item 3): buildFromDisk reads this from
+/// both copies to choose one, then fully decodes only the
+/// chosen copy. Any document that decodes as a JoeYtFile also
+/// decodes as this (same required top-level String key).
+private struct JoeYtFileStamp: Decodable, Sendable {
+    let generatedAt: String
+}
+
 // MARK: - Poster resolution (2.0.47)
 //
 // The owner's order: YouTube/TVB series cards and the
@@ -609,6 +618,10 @@ final class JoeYtStore: ObservableObject {
         try? JSONDecoder().decode(JoeYtFile.self, from: data)
     }
 
+    private nonisolated static func decodeStamp(_ data: Data) -> String? {
+        (try? JSONDecoder().decode(JoeYtFileStamp.self, from: data))?.generatedAt
+    }
+
     private nonisolated static func parseDate(_ string: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
@@ -625,28 +638,44 @@ final class JoeYtStore: ObservableObject {
                                           withExtension: "json")
             .flatMap { try? Data(contentsOf: $0) }
         let cacheData = try? Data(contentsOf: cacheURL)
-        let bundled = bundledData.flatMap { decodeFile($0) }
-        let cached = cacheData.flatMap { decodeFile($0) }
 
+        // claude/opt-1 (OPTIMIZATION-AUDIT item 3): pre-fix both
+        // ~6.9 MB copies were FULLY decoded (and held at once)
+        // only to compare their stamps. Now the stamps are read
+        // first, the copies are ordered by exactly the old rule
+        // (cache wins ties; an unparseable stamp sorts as
+        // distantPast), and only the preferred copy is fully
+        // decoded. If it fails to decode, the other copy is
+        // tried — the old "a copy that fails to decode is not a
+        // candidate" outcome — so the chosen file is the same
+        // in every case.
+        var candidates: [(data: Data, fromCache: Bool)] = []
+        let bundledStamp = bundledData.flatMap { decodeStamp($0) }
+        let cachedStamp = cacheData.flatMap { decodeStamp($0) }
+        switch (bundledData, bundledStamp, cacheData, cachedStamp) {
+        case let (b?, bs?, c?, cs?):
+            let bd = parseDate(bs) ?? .distantPast
+            let cd = parseDate(cs) ?? .distantPast
+            if cd >= bd {
+                candidates = [(c, true), (b, false)]
+            } else {
+                candidates = [(b, false), (c, true)]
+            }
+        case let (b?, _?, _, nil):
+            candidates = [(b, false)]
+        case let (_, nil, c?, _?):
+            candidates = [(c, true)]
+        default:
+            return nil
+        }
         var chosen: JoeYtFile?
         var fromCache = false
-        switch (bundled, cached) {
-        case let (b?, c?):
-            let bd = parseDate(b.generatedAt) ?? .distantPast
-            let cd = parseDate(c.generatedAt) ?? .distantPast
-            if cd >= bd {
-                chosen = c
-                fromCache = true
-            } else {
-                chosen = b
+        for candidate in candidates {
+            if let file = decodeFile(candidate.data) {
+                chosen = file
+                fromCache = candidate.fromCache
+                break
             }
-        case let (b?, nil):
-            chosen = b
-        case let (nil, c?):
-            chosen = c
-            fromCache = true
-        case (nil, nil):
-            return nil
         }
         guard let file = chosen else { return nil }
         let displayed = TVBCatalogStore.load()?

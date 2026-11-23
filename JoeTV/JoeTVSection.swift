@@ -559,7 +559,13 @@ struct JoeTVSection: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 4)
                     .id("joeTVSectionTop")
+                    // claude/opt-2 (owner photo: outermost tile frame cut):
+                    // the PC tile ring (3/5) + 1.045 scale reach past the
+                    // clip; inset 16 + scroll widened 16, horizontally
+                    // only (the v2.0.16 vertical clip rule stands).
+                    .padding(.horizontal, 16)
                 }
+                .padding(.horizontal, -16)
                 // v2.0.49 (item 7, fix round): the
                 // Menu-to-top jump's scroll hook, inside
                 // the reader.
@@ -641,7 +647,13 @@ struct JoeTVSection: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 4)
                     .id("joeTVSectionTop")
+                    // claude/opt-2 (owner photo: outermost tile frame cut):
+                    // the PC tile ring (3/5) + 1.045 scale reach past the
+                    // clip; inset 16 + scroll widened 16, horizontally
+                    // only (the v2.0.16 vertical clip rule stands).
+                    .padding(.horizontal, 16)
                 }
+                .padding(.horizontal, -16)
                 // v2.0.49 (item 7, fix round): the
                 // Menu-to-top jump's scroll hook, inside
                 // the reader.
@@ -727,7 +739,13 @@ struct JoeTVSection: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 4)
                     .id("joeTVSectionTop")
+                    // claude/opt-2 (owner photo: outermost tile frame cut):
+                    // the PC tile ring (3/5) + 1.045 scale reach past the
+                    // clip; inset 16 + scroll widened 16, horizontally
+                    // only (the v2.0.16 vertical clip rule stands).
+                    .padding(.horizontal, 16)
                 }
+                .padding(.horizontal, -16)
                 // v2.0.49 (item 7, fix round): the
                 // Menu-to-top jump's scroll hook, inside
                 // the reader.

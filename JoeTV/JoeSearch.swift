@@ -427,7 +427,16 @@ struct JoeSearchView: View {
                 .padding(.vertical, 8)
                 .padding(.horizontal, 4)
             }
+            // claude/opt-2 (owner photo 2026-11-22: "bị cắt
+            // khung"): the focused card's outset ring + scale
+            // reach past this scroll view's clipping frame, so the
+            // outermost card lost part of its frame. The content
+            // is inset 16 and the scroll view widened by the same
+            // 16 on both sides: the clip edge moves out, every
+            // card stays exactly where it was (net geometry 0).
+            .padding(.horizontal, 16)
         }
+        .padding(.horizontal, -16)
     }
 
     private func pcDiscoveryCard(_ meta: TorMeta) -> some View {

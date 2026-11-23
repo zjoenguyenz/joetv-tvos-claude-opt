@@ -97,6 +97,86 @@ extension View {
     }
 }
 
+/// claude/opt-2 (FL-427, pinned state): the band cover for a
+/// Private Cinema home's pinned context strip.
+///
+/// Mechanism of the fault: joePCBarInset reserves the bar's
+/// height with a CLEAR safeAreaInset, and a scroll view's
+/// content keeps scrolling UNDER its insets. Once the strip
+/// pins, the rails therefore slide up behind the transparent
+/// bar and through any gap above the strip, so rail titles
+/// paint over whatever is behind (the poster backdrop). The
+/// deep-state drawing (RECALC-SPEC §3.0 / §3.1 "Trạng thái
+/// sâu"; TRIAL-Home-recalc-deep.png, measured: y0–131 flat
+/// Ink #0C1215, strip y132–219 Ink) has NOTHING above the
+/// strip but flat Ink under the bar's own text.
+///
+/// The cover is paint only (no state, no preference writes,
+/// so no layout feedback): a GeometryReader in the strip's
+/// background reads the strip's global frame; while the strip
+/// sits at the pinned position (its top within the band
+/// threshold below — the rest position is the hero stage's
+/// foot, 560/600, far below it) it paints theme.bg (Ink) from
+/// the screen's top edge down to the strip's bottom, across
+/// the full 1920 canvas. The shell draws the bar ABOVE the
+/// content, so the wordmark, nav and clock stay on top. At
+/// rest it paints nothing, so the hero/backdrop at rest is
+/// untouched.
+/// claude/opt-2 (owner, 2026-11-22: "backdrop bị 1 thanh
+/// ngang màu đen … làm theo dạng thanh kính để không bị
+/// che"): the Private Cinema context strip and the pinned
+/// band above it are GLASS, not opaque Ink. Once the backdrop
+/// became full screen (FL-457) the opaque 88 pt strip read as
+/// a black bar laid across the art. The glass is the system
+/// ultra-thin material (frosted: the art stays visible, rail
+/// text behind it is blurred illegible) under a light Ink
+/// tint for the strip's own text. One definition for the four
+/// homes' strips and the pinned band cover. Paint only.
+struct JoeCinemaGlass: View {
+    @Environment(\.joeTheme) private var theme
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.ultraThinMaterial)
+            theme.bg.opacity(0.35)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+let joePCPinnedStripThreshold: CGFloat = 330
+
+private struct JoePCPinnedBandCover: ViewModifier {
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.background(alignment: .topLeading) {
+                GeometryReader { geo in
+                    let frame = geo.frame(in: .global)
+                    let pinned = frame.minY <= joePCPinnedStripThreshold
+                    let above = max(0, frame.minY)
+                    // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
+                    JoeCinemaGlass()
+                        .frame(width: 1920,
+                               height: pinned ? above + frame.height : 0)
+                        .offset(x: -frame.minX, y: -above)
+                        .allowsHitTesting(false)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPinnedBandCover() -> some View {
+        modifier(JoePCPinnedBandCover())
+    }
+}
+
 // MARK: - Design top bar pieces (FIX-213, Fault 8)
 //
 // The Private Cinema design set's own header (measured
@@ -163,7 +243,7 @@ struct PCNavLabel: View {
                     .font(.system(size: 20))
             }
             Text(title)
-                .font(JoePCType.outfit(24))
+                .font(JoePCType.outfit(24, weight: selected ? .semibold : .regular))
         }
         // FIX-214 (owner ruling 2026-11-22 14:46 CST —
         // Chỉ thị 10): menu focus is the RING ONLY. While
@@ -178,13 +258,18 @@ struct PCNavLabel: View {
         // selected + focused item wore fill AND ring
         // while its neighbour wore ring only — the
         // desync in the owner's clip.)
-        .foregroundStyle(selected && !isFocused ? theme.bg : theme.text)
+        // claude/opt-2 (FL-422, owner ruling): the nav fill is
+        // GONE at every state — no ivory capsule, selected or
+        // not, focused or not. Selected is carried by the text
+        // alone (semibold, see the font below); focus stays the
+        // celadon ring + scale. The 13 × 27 padding is kept so
+        // the ring's geometry and the bar's spacing are
+        // unchanged.
+        .foregroundStyle(theme.text)
         .lineLimit(1)
         .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 27)
         .padding(.vertical, 13)
-        .background(Capsule().fill(selected && !isFocused
-                                   ? theme.text : Color.clear))
         .overlay {
             if isFocused {
                 Capsule()
@@ -229,6 +314,26 @@ enum JoeCinemaScrims {
         ], startPoint: .leading, endPoint: .trailing)
     }
 
+    /// claude/opt-2 (FL-457, owner ruling): the vertical scrim
+    /// of the FULL-SCREEN page backdrop. The design's stage
+    /// ramp (`bottom` below) ended at 0x1F Ink on the stage's
+    /// foot, which is the hard cut the owner rejected once
+    /// the art runs the whole screen. This ramp takes the
+    /// melt of the theme's own full-screen detail backdrop
+    /// (JoeMovieDetail.cinemaBackdrop: clear by 0.35, bg 0.88
+    /// at 0.85, full bg at the bottom) so the rails sit on
+    /// near-full Ink. Its top stays CLEAR (not the detail's
+    /// 0.30): FIX-213 Fault 8 ruled out any top darkening of
+    /// the art under the bar ("Làm che luôn backdrop").
+    static var page: LinearGradient {
+        LinearGradient(stops: [
+            .init(color: ink.opacity(0), location: 0),
+            .init(color: ink.opacity(0), location: 0.35),
+            .init(color: ink.opacity(0.88), location: 0.85),
+            .init(color: ink.opacity(1), location: 1)
+        ], startPoint: .top, endPoint: .bottom)
+    }
+
     static var bottom: LinearGradient {
         LinearGradient(stops: [
             .init(color: ink.opacity(50.0 / 255.0), location: 0),
@@ -252,6 +357,21 @@ enum JoeCinemaScrims {
 // stand-in — the compression then errs toward MORE air,
 // never toward the overlap this budget exists to kill).
 enum JoeHeroMeasure {
+    // claude/opt-2 (FL-447 R2): the hero bodies call these on
+    // every render — i.e. on every focus move — and each call
+    // did a UIFont(name:) lookup plus an NSString text layout.
+    // Both answers depend only on (text, face, size, width),
+    // and the bundled faces are registered once at launch
+    // (UIAppFonts), so the results are memoised. NSCache is
+    // thread-safe and evicts under memory pressure; a miss
+    // runs the original computation unchanged.
+    private nonisolated(unsafe) static let linesMemo: NSCache<NSString, NSNumber> = {
+        let cache = NSCache<NSString, NSNumber>()
+        cache.countLimit = 512
+        return cache
+    }()
+    private nonisolated(unsafe) static let lineHeightMemo = NSCache<NSString, NSNumber>()
+
     private static func font(_ postScriptName: String,
                              _ size: CGFloat) -> UIFont {
         UIFont(name: postScriptName, size: size)
@@ -263,17 +383,27 @@ enum JoeHeroMeasure {
     static func lines(of text: String, postScriptName: String,
                       size: CGFloat, width: CGFloat) -> Int {
         guard !text.isEmpty else { return 0 }
+        let key = "\(postScriptName)|\(size)|\(width)|\(text)" as NSString
+        if let hit = linesMemo.object(forKey: key) { return hit.intValue }
         let f = font(postScriptName, size)
         let rect = (text as NSString).boundingRect(
             with: CGSize(width: width, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: [.font: f], context: nil)
-        return max(1, Int(ceil(rect.height / f.lineHeight)))
+        let count = max(1, Int(ceil(rect.height / f.lineHeight)))
+        linesMemo.setObject(NSNumber(value: count), forKey: key)
+        return count
     }
 
     static func lineHeight(postScriptName: String,
                            size: CGFloat) -> CGFloat {
-        font(postScriptName, size).lineHeight
+        let key = "\(postScriptName)|\(size)" as NSString
+        if let hit = lineHeightMemo.object(forKey: key) {
+            return CGFloat(hit.doubleValue)
+        }
+        let height = font(postScriptName, size).lineHeight
+        lineHeightMemo.setObject(NSNumber(value: Double(height)), forKey: key)
+        return height
     }
 }
 
@@ -671,7 +801,8 @@ final class JoeCinemaBackdropController: ObservableObject {
         defer { backdropTask.cancel(); hedgeTask.cancel() }
         while !box.settled {
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the box.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
         if let win = box.winner {
             return (win.image, win.source)
@@ -768,6 +899,9 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
     private var posterClaimed = false
     private var backdropDone = false
     private var posterDone: Bool
+    /// Wakes loadBackdrop's wait loop whenever the settled
+    /// state can have changed (claude/opt-1).
+    let wake = JoeWake()
 
     init(posterLegExists: Bool) {
         posterDone = !posterLegExists
@@ -779,6 +913,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         if leg == .backdrop { backdropDone = true }
         if leg == .poster { posterDone = true }
         lock.unlock()
+        wake.signal()
     }
 
     /// The backdrop leg finished with NO bitmap. Its
@@ -790,6 +925,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         backdropDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// The CLAIMED poster leg finished with NO bitmap
@@ -800,6 +936,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         posterDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// True exactly once — for the leg that runs the
@@ -854,6 +991,58 @@ struct JoeCinemaBackdropLayer: View {
                     .opacity(controller.topOpacity)
             }
         }
+    }
+}
+
+/// claude/opt-2 (FL-457, owner ruling): the Private Cinema
+/// home's FULL-SCREEN backdrop. The owner's standard
+/// overrides RECALC-SPEC's confined hero stage: the art
+/// fills the whole screen like the original theme and like
+/// the detail backdrops. This is the same focus-follows
+/// controller and crossfade layer the hero stage carried,
+/// hoisted to page level BEHIND the home's ScrollView
+/// (mounted with .background, ignoring the safe area), under
+/// the design's left scrim and the full-height `page` ramp.
+/// The hero stage above it is now text-only at its unchanged
+/// 560/600 frame; the pinned strip keeps its opaque Ink.
+struct JoeCinemaPageBackdrop: View {
+    @ObservedObject var controller: JoeCinemaBackdropController
+
+    var body: some View {
+        ZStack {
+            JoeCinemaBackdropLayer(controller: controller)
+            Rectangle().fill(JoeCinemaScrims.left)
+            Rectangle().fill(JoeCinemaScrims.page)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .clipped()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Mounts JoeCinemaPageBackdrop behind a home's scroll view,
+/// Private Cinema only (other themes: unchanged).
+private struct JoePCPageBackdrop: ViewModifier {
+    @ObservedObject var controller: JoeCinemaBackdropController
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.background {
+                JoeCinemaPageBackdrop(controller: controller)
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPageBackdrop(_ controller: JoeCinemaBackdropController) -> some View {
+        modifier(JoePCPageBackdrop(controller: controller))
     }
 }
 
