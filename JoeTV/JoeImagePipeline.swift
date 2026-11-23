@@ -773,6 +773,20 @@ struct JoeRemoteImage<Placeholder: View>: View {
     /// The first paint is never blocked: until an accepted
     /// bitmap exists the placeholder paints.
     private func resolve() async -> UIImage? {
+        // claude/opt-1 (OPTIMIZATION-AUDIT item 2): warm fast
+        // path. When the decoded cache already holds an
+        // accepted primary bitmap, the race below can only end
+        // one way — image(for:) returns this same cache hit
+        // at once, the primary leg accepts it and wins — so it
+        // is returned directly, with the same log line, instead
+        // of spawning the primary + hedge tasks and a wait loop
+        // for every warm card that scrolls back into view.
+        if let warm = JoeImagePipeline.shared.cachedImage(
+               for: url, targetPixels: targetPixels),
+           slotClass.accepts(warm) {
+            logResolve(leg: "primary", source: url, image: warm)
+            return warm
+        }
         let box = JoeResolveRaceBox()
         // Gate R2 fix (Lens A MINOR 2): the primary task
         // is STORED and cancelled by the same defer as the
