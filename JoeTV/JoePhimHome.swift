@@ -3916,7 +3916,6 @@ struct JoeRailSpec: Identifiable {
     var id: String { scope }
 }
 
-@MainActor
 /// claude/opt-2 (FL-447 R1): the TVB title a Private Cinema
 /// focus ID names, by direct key. Replaces
 /// `byId.values.first { focus.hasSuffix("|\($0.tmdbId)") }` —
@@ -3933,6 +3932,7 @@ func joePCTVBTitle(forFocus focus: String,
     return byId[id]
 }
 
+@MainActor
 func joeRailSpecs(phim: PhimStore, themeID: JoeThemeID) -> [JoeRailSpec] {
     var specs: [JoeRailSpec] = []
     // Design F's cards carry BOTH badges in every rail (the

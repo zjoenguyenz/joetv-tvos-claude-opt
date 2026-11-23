@@ -1675,12 +1675,6 @@ struct JoeTVBView: View {
         var id: String { scope }
     }
 
-    /// The five pipeline rails in build order, then the
-    /// Idea 1 rich shelves (2.0.25: decade shelves, Trọn bộ,
-    /// Hay nhất, Nhiều phần — computed below from the
-    /// displayed titles), then the seven genre shelves in
-    /// audit order. A rail renders only when it resolves to
-    /// at least one displayed title.
     /// claude/opt-2 (FL-447 R4): railSpecs(catalog) is a pure
     /// function of the catalogue, and `catalog` is assigned
     /// exactly once (loadCatalog's guard), yet the strip, the
@@ -1696,6 +1690,12 @@ struct JoeTVBView: View {
     }
     @State private var railSpecsMemo = RailSpecsMemo()
 
+    /// The five pipeline rails in build order, then the
+    /// Idea 1 rich shelves (2.0.25: decade shelves, Trọn bộ,
+    /// Hay nhất, Nhiều phần — computed below from the
+    /// displayed titles), then the seven genre shelves in
+    /// audit order. A rail renders only when it resolves to
+    /// at least one displayed title.
     private func railSpecs(_ catalog: TVBCatalog) -> [RailSpec] {
         let key = "\(catalog.version)|\(catalog.generatedAt)|\(catalog.titles.count)"
         if railSpecsMemo.key == key { return railSpecsMemo.specs }

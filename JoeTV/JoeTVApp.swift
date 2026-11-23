@@ -1190,14 +1190,6 @@ struct JoeRootView: View {
     }
 }
 
-/// The pill's label (convergence, Team 7 item 2): reads its OWN
-/// focus state from the environment — the focus engine writes
-/// `isFocused` into a focused view's subtree as a pure rendering
-/// input; the label branches on it only to pick colours INSIDE
-/// one stable view, writes nothing back, and no view's structure
-/// depends on it. v2.0.0 (UI-5): theme tokens — selected or
-/// focused wears the theme accent fill, focus adds the theme
-/// ring; NO scale (construction law).
 /// claude/opt-2 (FL-448 Fault 1 + Fault 6): INSTRUMENTATION
 /// ONLY. Candidate mechanism for the horizontal-only stretch
 /// on Private Cinema compositions: the PC shell is one
@@ -1235,6 +1227,14 @@ private struct JoePCWidthProbe: View {
     }
 }
 
+/// The pill's label (convergence, Team 7 item 2): reads its OWN
+/// focus state from the environment — the focus engine writes
+/// `isFocused` into a focused view's subtree as a pure rendering
+/// input; the label branches on it only to pick colours INSIDE
+/// one stable view, writes nothing back, and no view's structure
+/// depends on it. v2.0.0 (UI-5): theme tokens — selected or
+/// focused wears the theme accent fill, focus adds the theme
+/// ring; NO scale (construction law).
 private struct PillLabel: View {
     let title: String
     let icon: String
