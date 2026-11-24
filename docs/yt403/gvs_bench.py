@@ -30,8 +30,8 @@ ITAGS = [18, 135, 137, 140]
 UA_TV = ("Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 "
          "(KHTML, like Gecko) Version/2.4.0 TV Safari/538.1")
 
-def ytdlp(vid, client, cookies):
-    cmd = ["yt-dlp", "-J", "-v", "--extractor-args",
+def ytdlp(vid, client, cookies, extra=()):
+    cmd = ["yt-dlp", "-J", "-v", *extra, "--extractor-args",
            f"youtube:player_client={client}", f"https://www.youtube.com/watch?v={vid}"]
     if cookies:
         cmd[1:1] = ["--cookies", cookies]
@@ -62,6 +62,8 @@ def main():
     ap.add_argument("--cookies")
     ap.add_argument("--clients", default=",".join(CLIENTS))
     ap.add_argument("--vids", default=",".join(VIDS))
+    ap.add_argument("--extra", default="",
+                    help="extra yt-dlp args, e.g. --extra '--add-header Authorization:Bearer\\ $T'")
     ap.add_argument("--poll", action="store_true",
                     help="also re-request the first-media range of itag 140 at "
                          "t=0,1,2,4,8,16,30 s after resolve (warm-up vs persistent 403)")
@@ -70,7 +72,7 @@ def main():
     print(f"yt-dlp {v.stdout.strip()}  mode={'cookies' if a.cookies else 'anonymous'}")
     for vid in a.vids.split(","):
         for client in a.clients.split(","):
-            info, warn, player, err = ytdlp(vid, client, a.cookies)
+            info, warn, player, err = ytdlp(vid, client, a.cookies, __import__('shlex').split(a.extra))
             print(f"\n== {vid}  client={client}  player={sorted(set(player)) or '?'}")
             for w in warn[:6]:
                 print("   warn:", w[:160])
