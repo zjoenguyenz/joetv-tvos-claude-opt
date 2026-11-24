@@ -233,6 +233,66 @@ struct JoePCStripTextWidthKey: PreferenceKey {
     }
 }
 
+/// claude/strip-legibility: the pinned strip's text-line hold —
+/// the vertical opacity profile of the Ink overlay that keeps the
+/// title/meta line at the eyebrow line's density (see the call in
+/// JoePCPinnedBandCover). Pure arithmetic on layout values the
+/// cover already reads; no state, no per-focus work.
+enum JoePCStripHold {
+    /// Glass Ink tint inside JoeCinemaGlass(frosted: true).
+    static let glassInk: Double = 0.35
+    /// The baseline strip overlay (top of the strip).
+    static let topOverlay: Double = 0.5
+    /// Density the eyebrow line already gets: 1 − 0.65 × 0.5.
+    static let target: Double = 1 - (1 - glassInk) * (1 - topOverlay)
+    /// Fade below the text block: 40 pt past the strip's bottom
+    /// edge, so the hold's fade (text bottom → skirt end, 50 pt on
+    /// an 88 pt strip) has the same slope as the glass's own
+    /// baseline dissolve (0.675 over 52 pt) — no new cut line.
+    static let skirt: CGFloat = 40
+
+    /// The glass's own bottom-dissolve mask value at strip-local y
+    /// (1 down to 78 % of the cover, then linear to 0).
+    static func glassMask(y: CGFloat, stripHeight h: CGFloat, above: CGFloat) -> Double {
+        let coverH = above + h
+        guard coverH > 0 else { return 0 }
+        let f = Double((above + y) / coverH)
+        return f <= 0.78 ? 1 : max(0, (1 - f) / 0.22)
+    }
+
+    /// Overlay opacity that makes glass + overlay = target.
+    static func overlay(atGlassMask m: Double) -> Double {
+        min(target, max(0, 1 - (1 - target) / (1 - glassInk * m)))
+    }
+
+    static func stops(stripHeight h: CGFloat, above: CGFloat,
+                      ink: Color) -> [Gradient.Stop] {
+        let total = h + skirt
+        guard h > 0 else { return [Gradient.Stop(color: .clear, location: 0)] }
+        // Text block (eyebrow 15 + 4 + title 34 ≈ 66 pt) is centred
+        // in the strip: its bottom sits at h/2 + 33; +1 for descenders.
+        let holdEnd = min(h, h / 2 + 34)
+        let coverH = above + h
+        let dStart = min(holdEnd, max(0, 0.78 * coverH - above))
+        func stop(_ y: CGFloat, _ o: Double) -> Gradient.Stop {
+            Gradient.Stop(color: ink.opacity(o), location: y / total)
+        }
+        let mid = dStart + (holdEnd - dStart) / 2
+        let oMid = overlay(atGlassMask: glassMask(y: mid, stripHeight: h, above: above))
+        let oEnd = overlay(atGlassMask: glassMask(y: holdEnd, stripHeight: h, above: above))
+        let tail = total - holdEnd
+        return [
+            stop(0, topOverlay),
+            stop(dStart, topOverlay),
+            stop(mid, oMid),
+            stop(holdEnd, oEnd),
+            stop(holdEnd + 0.45 * tail, oEnd * 0.55),
+            stop(holdEnd + 0.78 * tail, oEnd * 0.22),
+            stop(total, 0),
+        ]
+    }
+}
+
 private struct JoePCPinnedBandCover: ViewModifier {
     @Environment(\.joeTheme) private var theme
 
@@ -258,38 +318,62 @@ private struct JoePCPinnedBandCover: ViewModifier {
                     let streakW = textW > 0 ? min(1920, textEnd + 340) : 1560
                     let solidAt = textW > 0 ? min(0.85, textEnd / streakW) : 0.60
                     let fadeSpan = 1 - solidAt
-                    JoeCinemaGlass(frosted: true)
-                        .overlay(alignment: .bottom) {
-                            theme.bg.opacity(pinned ? 0.5 : 0)
-                                .frame(height: frame.height)
-                        }
-                        .frame(width: streakW,
-                               height: pinned ? above + frame.height : 0)
-                        .mask {
-                            // Cách C3: same eased profile as the at-rest streak.
-                            LinearGradient(stops: [
-                                Gradient.Stop(color: .black, location: 0),
-                                Gradient.Stop(color: .black, location: solidAt),
-                                Gradient.Stop(color: .black.opacity(0.55), location: solidAt + 0.45 * fadeSpan),
-                                Gradient.Stop(color: .black.opacity(0.22), location: solidAt + 0.78 * fadeSpan),
-                                Gradient.Stop(color: .clear, location: 1),
-                            ], startPoint: .leading, endPoint: .trailing)
-                        }
-                        .mask {
-                            // Cách C3: bottom edge dissolves over the last
-                            // 22% (was 10%) — no visible cut line over the
-                            // posters below the pinned strip.
-                            LinearGradient(stops: [
-                                Gradient.Stop(color: .black, location: 0),
-                                Gradient.Stop(color: .black, location: 0.78),
-                                Gradient.Stop(color: .clear, location: 1),
-                            ], startPoint: .top, endPoint: .bottom)
-                        }
-                        .frame(width: 1920,
-                               height: pinned ? above + frame.height : 0,
-                               alignment: .leading)
-                        .offset(x: -frame.minX, y: -above)
-                        .allowsHitTesting(false)
+                    let hMask = LinearGradient(stops: [
+                        // Cách C3: same eased profile as the at-rest streak.
+                        Gradient.Stop(color: .black, location: 0),
+                        Gradient.Stop(color: .black, location: solidAt),
+                        Gradient.Stop(color: .black.opacity(0.55), location: solidAt + 0.45 * fadeSpan),
+                        Gradient.Stop(color: .black.opacity(0.22), location: solidAt + 0.78 * fadeSpan),
+                        Gradient.Stop(color: .clear, location: 1),
+                    ], startPoint: .leading, endPoint: .trailing)
+                    let coverH = above + frame.height
+                    ZStack(alignment: .topLeading) {
+                        // The frosted streak — baseline geometry and
+                        // masks unchanged; only the Ink 0.5 strip
+                        // overlay moved out of it (see the hold below).
+                        JoeCinemaGlass(frosted: true)
+                            .frame(width: streakW, height: pinned ? coverH : 0)
+                            .mask { hMask }
+                            .mask {
+                                // Cách C3: bottom edge dissolves over the last
+                                // 22% (was 10%) — no visible cut line over the
+                                // posters below the pinned strip.
+                                LinearGradient(stops: [
+                                    Gradient.Stop(color: .black, location: 0),
+                                    Gradient.Stop(color: .black, location: 0.78),
+                                    Gradient.Stop(color: .clear, location: 1),
+                                ], startPoint: .top, endPoint: .bottom)
+                            }
+                        // claude/strip-legibility: the text-line hold.
+                        // Pre-fix the Ink 0.5 strip overlay sat INSIDE
+                        // the 22% bottom dissolve above, and with the
+                        // strip pinned under the 148 pt bar that
+                        // dissolve begins ~36 pt into the 88 pt strip —
+                        // exactly the title/meta line, which therefore
+                        // got ~0.43 → 0.24 cover density instead of
+                        // the 0.675 the eyebrow line gets: the washout
+                        // over bright posters. The hold paints the
+                        // overlay on its own vertical profile, sized so
+                        // glass + hold = the eyebrow line's 0.675 all
+                        // the way down to the text block's bottom, then
+                        // the house eased fade (×.55 / ×.22 / 0) over a
+                        // 40 pt skirt. Same horizontal streak mask. No
+                        // new density level, no new shape.
+                        LinearGradient(
+                            stops: JoePCStripHold.stops(
+                                stripHeight: frame.height, above: above,
+                                ink: theme.bg),
+                            startPoint: .top, endPoint: .bottom)
+                            .frame(width: streakW,
+                                   height: pinned ? frame.height + JoePCStripHold.skirt : 0)
+                            .mask { hMask }
+                            .padding(.top, pinned ? above : 0)
+                    }
+                    .frame(width: 1920,
+                           height: pinned ? coverH + JoePCStripHold.skirt : 0,
+                           alignment: .topLeading)
+                    .offset(x: -frame.minX, y: -above)
+                    .allowsHitTesting(false)
                 }
             }
         } else {
