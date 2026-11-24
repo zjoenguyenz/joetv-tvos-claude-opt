@@ -233,68 +233,111 @@ struct JoePCStripTextWidthKey: PreferenceKey {
     }
 }
 
+/// claude/strip-backdrop-cover (owner 2026-11-23, TV photos:
+/// "cái vệt đó … nhìn khó chịu … cách nào chuyên nghiệp hơn"):
+/// the pinned strip no longer carries a frosted streak. While
+/// the strip is pinned, the region from the screen top down to
+/// the strip's bottom is covered by a COPY of the page backdrop
+/// itself — the same bitmap(s), the same crossfade, the same
+/// left/page scrims, at the same screen position — so the cover
+/// is pixel-identical to what sits behind it and has no visible
+/// shape. Its only visible effect: rails that scroll up under
+/// the strip dissolve into the backdrop over a short eased skirt
+/// below the strip instead of sliding behind the title. The
+/// strip itself keeps its at-rest streak (JoeCinemaStreak), so
+/// pinned reads the same as rest. A gentle Ink ramp gives the
+/// strip band the page-scrim value the strip has at rest
+/// (≈0.35 at y 560–648), starting below the bar's text.
+///
+/// Performance: no blur, no material. The copy is cropped to
+/// the cover (1920 × strip bottom + skirt) and flattened with
+/// drawingGroup, so it re-rasterizes only when the backdrop
+/// changes (focus crossfade) or the strip moves into its pinned
+/// spot — never per scroll frame once pinned.
 private struct JoePCPinnedBandCover: ViewModifier {
     @Environment(\.joeTheme) private var theme
+    @Environment(\.joePCBackdropController) private var backdrop
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if theme.id == .privateCinema {
-            content.backgroundPreferenceValue(JoePCStripTextWidthKey.self) { textW in
+            content.background(alignment: .topLeading) {
                 GeometryReader { geo in
                     let frame = geo.frame(in: .global)
                     let pinned = frame.minY <= joePCPinnedStripThreshold
                     let above = max(0, frame.minY)
-                    // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
-                    // Owner's strip (2026-11-23): pinned is the same ONE
-                    // streak — frosted glass from the left edge, solid
-                    // across the longest-title zone, then a long soft fade
-                    // to nothing. No right patch, no full-width slab.
-                    // Cách C2: streak length follows the measured title —
-                    // solid from the screen edge to the end of the text
-                    // block (frame.minX + the strip's 14pt leading pad +
-                    // textW), then the fade tail; fixed 1560/0.60 only as
-                    // the pre-measure fallback.
-                    let textEnd = frame.minX + 14 + textW
-                    let streakW = textW > 0 ? min(1920, textEnd + 340) : 1560
-                    let solidAt = textW > 0 ? min(0.85, textEnd / streakW) : 0.60
-                    let fadeSpan = 1 - solidAt
-                    JoeCinemaGlass(frosted: true)
-                        .overlay(alignment: .bottom) {
-                            theme.bg.opacity(pinned ? 0.5 : 0)
-                                .frame(height: frame.height)
-                        }
-                        .frame(width: streakW,
-                               height: pinned ? above + frame.height : 0)
-                        .mask {
-                            // Cách C3: same eased profile as the at-rest streak.
-                            LinearGradient(stops: [
-                                Gradient.Stop(color: .black, location: 0),
-                                Gradient.Stop(color: .black, location: solidAt),
-                                Gradient.Stop(color: .black.opacity(0.55), location: solidAt + 0.45 * fadeSpan),
-                                Gradient.Stop(color: .black.opacity(0.22), location: solidAt + 0.78 * fadeSpan),
-                                Gradient.Stop(color: .clear, location: 1),
-                            ], startPoint: .leading, endPoint: .trailing)
-                        }
-                        .mask {
-                            // Cách C3: bottom edge dissolves over the last
-                            // 22% (was 10%) — no visible cut line over the
-                            // posters below the pinned strip.
-                            LinearGradient(stops: [
-                                Gradient.Stop(color: .black, location: 0),
-                                Gradient.Stop(color: .black, location: 0.78),
-                                Gradient.Stop(color: .clear, location: 1),
-                            ], startPoint: .top, endPoint: .bottom)
-                        }
-                        .frame(width: 1920,
-                               height: pinned ? above + frame.height : 0,
-                               alignment: .leading)
-                        .offset(x: -frame.minX, y: -above)
-                        .allowsHitTesting(false)
+                    if pinned {
+                        JoePCPinnedBackdropCover(
+                            controller: backdrop,
+                            stripTop: above,
+                            stripBottom: above + frame.height)
+                            .offset(x: -frame.minX, y: -above)
+                    }
                 }
             }
         } else {
             content
         }
+    }
+}
+
+/// The cover's paint (see JoePCPinnedBandCover).
+private struct JoePCPinnedBackdropCover: View {
+    /// nil only if a home forgot joePCPageBackdrop — then the
+    /// cover falls back to flat Ink (the FL-427 deep state).
+    let controller: JoeCinemaBackdropController?
+    let stripTop: CGFloat
+    let stripBottom: CGFloat
+    @Environment(\.joeTheme) private var theme
+
+    /// Eased dissolve of the rails below the strip.
+    static let skirt: CGFloat = 44
+    /// The page-scrim value the strip sits on at rest.
+    static let stripTint: Double = 0.35
+    /// The tint ramps in over this distance above the strip.
+    static let tintRamp: CGFloat = 72
+
+    var body: some View {
+        let h = stripBottom + Self.skirt
+        ZStack(alignment: .top) {
+            if let controller {
+                ZStack {
+                    JoeCinemaBackdropLayer(controller: controller)
+                    Rectangle().fill(JoeCinemaScrims.left)
+                    Rectangle().fill(JoeCinemaScrims.page)
+                }
+                .frame(width: 1920, height: 1080)
+                .frame(width: 1920, height: h, alignment: .top)
+                .clipped()
+            } else {
+                theme.bg
+            }
+            LinearGradient(stops: [
+                Gradient.Stop(color: theme.bg.opacity(0), location: 0),
+                Gradient.Stop(color: theme.bg.opacity(0),
+                              location: max(0, stripTop - Self.tintRamp) / h),
+                Gradient.Stop(color: theme.bg.opacity(Self.stripTint),
+                              location: stripTop / h),
+                Gradient.Stop(color: theme.bg.opacity(Self.stripTint), location: 1),
+            ], startPoint: .top, endPoint: .bottom)
+        }
+        .frame(width: 1920, height: h, alignment: .top)
+        .drawingGroup()
+        .mask {
+            // Solid through the strip, then the house eased fade
+            // (×.55 / ×.22 / 0) over the skirt.
+            let solid = stripBottom / h
+            let span = 1 - solid
+            LinearGradient(stops: [
+                Gradient.Stop(color: .black, location: 0),
+                Gradient.Stop(color: .black, location: solid),
+                Gradient.Stop(color: .black.opacity(0.55), location: solid + 0.45 * span),
+                Gradient.Stop(color: .black.opacity(0.22), location: solid + 0.78 * span),
+                Gradient.Stop(color: .clear, location: 1),
+            ], startPoint: .top, endPoint: .bottom)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1158,6 +1201,19 @@ struct JoeCinemaPageBackdrop: View {
     }
 }
 
+private struct JoePCBackdropControllerKey: EnvironmentKey {
+    static let defaultValue: JoeCinemaBackdropController? = nil
+}
+
+extension EnvironmentValues {
+    /// The home's page-backdrop controller, published by
+    /// joePCPageBackdrop for the pinned strip's cover.
+    var joePCBackdropController: JoeCinemaBackdropController? {
+        get { self[JoePCBackdropControllerKey.self] }
+        set { self[JoePCBackdropControllerKey.self] = newValue }
+    }
+}
+
 /// Mounts JoeCinemaPageBackdrop behind a home's scroll view,
 /// Private Cinema only (other themes: unchanged).
 private struct JoePCPageBackdrop: ViewModifier {
@@ -1167,9 +1223,13 @@ private struct JoePCPageBackdrop: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if theme.id == .privateCinema {
-            content.background {
-                JoeCinemaPageBackdrop(controller: controller)
-            }
+            content
+                // claude/strip-backdrop-cover: the pinned strip's
+                // cover paints a copy of this same backdrop.
+                .environment(\.joePCBackdropController, controller)
+                .background {
+                    JoeCinemaPageBackdrop(controller: controller)
+                }
         } else {
             content
         }
