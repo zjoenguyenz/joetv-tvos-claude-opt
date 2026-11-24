@@ -142,6 +142,50 @@ extension View {
 /// while the strip is pinned and rails scroll beneath it; it
 /// covers the strip's own area too, so the pinned strip reads
 /// as frosted glass and rail text behind it stays illegible.
+/// Owner's strip (2026-11-23): NOT a bar — one streak from the left. The veil
+/// hugs the measured text block exactly (this view is the text block's
+/// background, extended by `tail` on the trailing side); the extension is the
+/// fade zone: the veil holds solid behind the text itself, then dissolves
+/// gradually across the whole tail and disappears completely. The text is
+/// never masked — only the veil fades.
+struct JoeCinemaStreak: View {
+    @Environment(\.joeTheme) private var theme
+    var tail: CGFloat = 460
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let solid = w > tail ? (w - tail) / w : 0
+            let tailFrac = w > tail ? tail / w : 1
+            ZStack {
+                theme.bg.opacity(0.30)
+                LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0)],
+                               startPoint: .top, endPoint: .bottom)
+            }
+            .mask {
+                // Cách C3 (owner polish): eased multi-stop fade — solid to
+                // the end of the text, then 55% / 22% / gone, so the tail
+                // dissolves softly instead of one straight ramp.
+                LinearGradient(stops: [
+                    Gradient.Stop(color: .black, location: 0),
+                    Gradient.Stop(color: .black, location: solid),
+                    Gradient.Stop(color: .black.opacity(0.55), location: solid + 0.45 * tailFrac),
+                    Gradient.Stop(color: .black.opacity(0.22), location: solid + 0.78 * tailFrac),
+                    Gradient.Stop(color: .clear, location: 1),
+                ], startPoint: .leading, endPoint: .trailing)
+            }
+            .mask {
+                LinearGradient(stops: [
+                    Gradient.Stop(color: .clear, location: 0),
+                    Gradient.Stop(color: .black, location: 0.22),
+                    Gradient.Stop(color: .black, location: 0.78),
+                    Gradient.Stop(color: .clear, location: 1),
+                ], startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
 struct JoeCinemaGlass: View {
     var frosted: Bool = false
     @Environment(\.joeTheme) private var theme
@@ -178,28 +222,72 @@ struct JoeCinemaGlass: View {
 
 let joePCPinnedStripThreshold: CGFloat = 330
 
+/// Cách C2 (owner, 2026-11-23): the strip publishes the measured width of its
+/// text block; the pinned cover sizes its streak from that number (+ a fade
+/// tail) instead of a fixed length — short title, short streak; long title,
+/// long streak. ("làm nó dạng fade theo độ dài của chữ title")
+struct JoePCStripTextWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct JoePCPinnedBandCover: ViewModifier {
     @Environment(\.joeTheme) private var theme
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if theme.id == .privateCinema {
-            content.background(alignment: .topLeading) {
+            content.backgroundPreferenceValue(JoePCStripTextWidthKey.self) { textW in
                 GeometryReader { geo in
                     let frame = geo.frame(in: .global)
                     let pinned = frame.minY <= joePCPinnedStripThreshold
                     let above = max(0, frame.minY)
                     // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
+                    // Owner's strip (2026-11-23): pinned is the same ONE
+                    // streak — frosted glass from the left edge, solid
+                    // across the longest-title zone, then a long soft fade
+                    // to nothing. No right patch, no full-width slab.
+                    // Cách C2: streak length follows the measured title —
+                    // solid from the screen edge to the end of the text
+                    // block (frame.minX + the strip's 14pt leading pad +
+                    // textW), then the fade tail; fixed 1560/0.60 only as
+                    // the pre-measure fallback.
+                    let textEnd = frame.minX + 14 + textW
+                    let streakW = textW > 0 ? min(1920, textEnd + 340) : 1560
+                    let solidAt = textW > 0 ? min(0.85, textEnd / streakW) : 0.60
+                    let fadeSpan = 1 - solidAt
                     JoeCinemaGlass(frosted: true)
-                        // claude/opt-2: when pinned, the strip's own
-                        // area keeps the darker look it had before
-                        // the mirror change (frosted + Ink 0.5).
                         .overlay(alignment: .bottom) {
                             theme.bg.opacity(pinned ? 0.5 : 0)
                                 .frame(height: frame.height)
                         }
-                        .frame(width: 1920,
+                        .frame(width: streakW,
                                height: pinned ? above + frame.height : 0)
+                        .mask {
+                            // Cách C3: same eased profile as the at-rest streak.
+                            LinearGradient(stops: [
+                                Gradient.Stop(color: .black, location: 0),
+                                Gradient.Stop(color: .black, location: solidAt),
+                                Gradient.Stop(color: .black.opacity(0.55), location: solidAt + 0.45 * fadeSpan),
+                                Gradient.Stop(color: .black.opacity(0.22), location: solidAt + 0.78 * fadeSpan),
+                                Gradient.Stop(color: .clear, location: 1),
+                            ], startPoint: .leading, endPoint: .trailing)
+                        }
+                        .mask {
+                            // Cách C3: bottom edge dissolves over the last
+                            // 22% (was 10%) — no visible cut line over the
+                            // posters below the pinned strip.
+                            LinearGradient(stops: [
+                                Gradient.Stop(color: .black, location: 0),
+                                Gradient.Stop(color: .black, location: 0.78),
+                                Gradient.Stop(color: .clear, location: 1),
+                            ], startPoint: .top, endPoint: .bottom)
+                        }
+                        .frame(width: 1920,
+                               height: pinned ? above + frame.height : 0,
+                               alignment: .leading)
                         .offset(x: -frame.minX, y: -above)
                         .allowsHitTesting(false)
                 }

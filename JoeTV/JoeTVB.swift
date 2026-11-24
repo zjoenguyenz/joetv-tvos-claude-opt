@@ -1466,33 +1466,27 @@ struct JoeTVBView: View {
                     }
                 }
             }
-            Spacer()
-            // FIX-8 / C-R4-2: right side is the drawing's
-            // TWO-LINE block — rail name over the Dãy
-            // line, right-aligned (values unchanged from
-            // tvbContextInfo's derivations).
-            VStack(alignment: .trailing, spacing: 4) {
-                if !info.railName.isEmpty {
-                    Text(info.railName)
-                        .font(JoePCType.outfit(22))
-                        .foregroundStyle(theme.heroMeta)
-                        .lineLimit(1)
+            .background(alignment: .leading) {
+                JoeCinemaStreak()
+                    .padding(.vertical, -14)
+                    .padding(.leading, -100)
+                    .padding(.trailing, -460)
+            }
+            .background {
+                GeometryReader { g in
+                    Color.clear
+                        .preference(key: JoePCStripTextWidthKey.self, value: g.size.width)
                 }
-                Text(info.railLine)
-                    .font(JoePCType.outfit(22))
-                    .foregroundStyle(theme.meta)
-                    .lineLimit(1)
             }
         }
         .padding(.leading, 14)
         .padding(.trailing, 14)
         .frame(height: 88)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)  // Cach C fix: strip content hugs the left edge (Spacer removed with the right block)
         // claude/opt-2 (owner: glass bar, not a black bar over
         // the full-screen backdrop): JoeCinemaGlass, drawn edge
         // to edge (background only, -80 over the safe-area inset;
         // no layout change).
-        .background { JoeCinemaGlass().padding(.horizontal, -80) }
     }
 
     /// The strip's content for the TVB home: resolve the
