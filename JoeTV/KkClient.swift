@@ -145,7 +145,8 @@ enum KkClient {
                 throw box.lastError ?? URLError(.cannotConnectToHost)
             }
             if Task.isCancelled { throw CancellationError() }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by report().
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
     }
 
@@ -393,6 +394,9 @@ private final class KkRaceBox: @unchecked Sendable {
     private var winnerValue: (host: Int, root: [String: Any])?
     private var errorValue: Error?
     private var settledValue = 0
+    /// Wakes the race's wait loop on every report
+    /// (claude/opt-1); first-write-wins is unchanged.
+    let wake = JoeWake()
 
     func report(host: Int, root: [String: Any]?, error: Error?) {
         lock.lock()
@@ -403,6 +407,7 @@ private final class KkRaceBox: @unchecked Sendable {
             errorValue = error
         }
         lock.unlock()
+        wake.signal()
     }
 
     var winner: (host: Int, root: [String: Any])? {
