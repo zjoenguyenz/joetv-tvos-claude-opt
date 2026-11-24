@@ -314,15 +314,34 @@ enum DiagLog {
 
     // MARK: - Formatting + redaction
 
-    /// One line's timestamp prefix. A fresh DateFormatter per
-    /// call: formatters are not thread-safe, writes are rare,
-    /// and this keeps the formatter entirely out of the
-    /// shared-state story above.
-    private static func timestamp() -> String {
+    /// One line's timestamp prefix. Until claude/opt-1 this
+    /// built a fresh DateFormatter per call ("formatters are
+    /// not thread-safe, writes are rare").
+    ///
+    /// claude/opt-1 (OPTIMIZATION-AUDIT item 5): writes are no
+    /// longer rare ([focus] lines fire per focus step), so the
+    /// formatter is built ONCE and reused under its own lock —
+    /// still entirely outside the file-state lock above. Same
+    /// locale and format; the time zone is the auto-updating
+    /// current zone, which is what a fresh formatter picked up
+    /// on every call, so the text of every line is unchanged.
+    /// Swift 6: nonisolated(unsafe) — the formatter is only
+    /// ever used inside timestampLock (the house lock
+    /// discipline, as with the statics above).
+    private static let timestampLock = NSLock()
+    private nonisolated(unsafe) static let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-        return f.string(from: Date())
+        f.timeZone = TimeZone.autoupdatingCurrent
+        return f
+    }()
+
+    private static func timestamp() -> String {
+        let now = Date()
+        return timestampLock.withLock {
+            timestampFormatter.string(from: now)
+        }
     }
 
     /// Scrub a message in three passes (v2.0.40, audit

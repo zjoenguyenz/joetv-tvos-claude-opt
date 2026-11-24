@@ -782,6 +782,9 @@ struct JoePhimHomeCore: View {
                 }
                 } header: {
                     cinemaContextStrip
+                        // claude/opt-2 (FL-427): Ink above the
+                        // strip while it is pinned.
+                        .joePCPinnedBandCover()
                 }
                 if catalogueEmpty && phim.loading && !phim.loadTimedOut {
                     ProgressView("Đang tải thư viện phim…")
@@ -823,6 +826,9 @@ struct JoePhimHomeCore: View {
             .padding(.bottom, 64)
         }
         .joePCBarInset()
+        // claude/opt-2 (FL-457): the full-screen backdrop behind
+        // the whole page (Private Cinema only; see JoePrivateCinema).
+        .joePCPageBackdrop(cinemaBackdrop)
         // v2.1.0 (Private Cinema): the Menu-to-top jump's
         // scroll hook, inside the reader — ultraHome's hook,
         // unchanged.
@@ -1296,32 +1302,27 @@ struct JoePhimHomeCore: View {
                     }
                 }
             }
-            Spacer()
-            // FIX-8 / C-R4-2: right side is the drawing's
-            // TWO-LINE block — rail name over the Dãy
-            // line, right-aligned (values unchanged from
-            // cinemaContextInfo's derivations).
-            VStack(alignment: .trailing, spacing: 4) {
-                if !info.railName.isEmpty {
-                    Text(info.railName)
-                        // FIX-214 (FULL-THEME-AUDIT-214
-                        // B3): the drawn right block is
-                        // Outfit 17, not 22.
-                        .font(JoePCType.outfit(17))
-                        .foregroundStyle(theme.heroMeta)
-                        .lineLimit(1)
+            .background(alignment: .leading) {
+                JoeCinemaStreak()
+                    .padding(.vertical, -14)
+                    .padding(.leading, -100)
+                    .padding(.trailing, -460)
+            }
+            .background {
+                GeometryReader { g in
+                    Color.clear
+                        .preference(key: JoePCStripTextWidthKey.self, value: g.size.width)
                 }
-                Text(info.railLine)
-                    .font(JoePCType.outfit(17))
-                    .foregroundStyle(theme.meta)
-                    .lineLimit(1)
             }
         }
         .padding(.leading, 14)
         .padding(.trailing, 14)
         .frame(height: 88)
-        .frame(maxWidth: .infinity)
-        .background(theme.bg)
+        .frame(maxWidth: .infinity, alignment: .leading)  // Cach C fix: strip content hugs the left edge (Spacer removed with the right block)
+        // claude/opt-2 (owner: glass bar, not a black bar over
+        // the full-screen backdrop): JoeCinemaGlass, drawn edge
+        // to edge (background only, -80 over the safe-area inset;
+        // no layout change).
     }
 
     /// The strip's content: (title, meta line, rail line)
@@ -1330,14 +1331,17 @@ struct JoePhimHomeCore: View {
     /// ("scope|provider|slug"), a CW/favourite entry
     /// ("cw|key" / "fav|key"), or the hero at rest.
     private var cinemaContextInfo: (title: String, meta: String, railName: String, railLine: String) {
-        let total = cinemaActiveRailTitles.count
+        // claude/opt-2 (FL-447 R1): the visible-rail list is
+        // built once here and handed to the position helpers.
+        let visibleTitles = cinemaActiveRailTitles
+        let total = visibleTitles.count
         if let focusedMovie {
             let parts = focusedMovie.split(separator: "|", maxSplits: 1)
             let scope = parts.isEmpty ? "" : String(parts[0])
             let remainder = parts.count > 1 ? String(parts[1]) : ""
             if let movie = railSpecs.flatMap({ $0.movies })
                 .first(where: { $0.id == remainder }) {
-                let rail = cinemaRailPosition(ofScope: scope)
+                let rail = cinemaRailPosition(ofScope: scope, titles: visibleTitles)
                 var meta: [String] = []
                 if !movie.year.isEmpty { meta.append(movie.year) }
                 if !movie.time.isEmpty { meta.append(movie.time) }
@@ -1345,10 +1349,8 @@ struct JoePhimHomeCore: View {
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
             }
-            if let title = pcTVBById.values.first(where: {
-                focusedMovie.hasSuffix("|\($0.tmdbId)")
-            }) {
-                let rail = cinemaRailPosition(ofScope: scope)
+            if let title = joePCTVBTitle(forFocus: focusedMovie, in: pcTVBById) {
+                let rail = cinemaRailPosition(ofScope: scope, titles: visibleTitles)
                 return (title.titleVi, title.cardMeta,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
@@ -1359,7 +1361,7 @@ struct JoePhimHomeCore: View {
                 // OWN catalogue (its "torCat:" focus ID),
                 // resolved by name in the visible-rail list
                 // — never the literal "Torrent".
-                let rail = cinemaTorrentRailPosition(forFocusedMovie: focusedMovie)
+                let rail = cinemaTorrentRailPosition(forFocusedMovie: focusedMovie, titles: visibleTitles)
                 return (meta.name, meta.year,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
@@ -1376,7 +1378,7 @@ struct JoePhimHomeCore: View {
             // "following" scope "Đang theo dõi".
             if scope == "following",
                let movie = followedMovies.first(where: { $0.id == remainder }) {
-                let rail = cinemaRailPosition(ofScope: scope)
+                let rail = cinemaRailPosition(ofScope: scope, titles: visibleTitles)
                 return (movie.name, movie.cardMeta,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
@@ -1384,13 +1386,13 @@ struct JoePhimHomeCore: View {
         }
         if let focusedEntry {
             if let entry = movieProgress.first(where: { "cw|" + $0.key == focusedEntry }) {
-                let rail = cinemaRailPosition(ofScope: "cw")
+                let rail = cinemaRailPosition(ofScope: "cw", titles: visibleTitles)
                 return (entry.title, entry.epLabel,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
             }
             if let entry = movieFavorites.first(where: { "fav|" + $0.key == focusedEntry }) {
-                let rail = cinemaRailPosition(ofScope: "favourites")
+                let rail = cinemaRailPosition(ofScope: "favourites", titles: visibleTitles)
                 return (entry.title, entry.year,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
@@ -1399,7 +1401,7 @@ struct JoePhimHomeCore: View {
             // rail binds "tvbcw|<key>" — resolve it to its
             // own rail instead of falling through to the hero.
             if let entry = tvbProgress.first(where: { "tvbcw|" + $0.key == focusedEntry }) {
-                let rail = cinemaRailPosition(ofScope: "tvbCw")
+                let rail = cinemaRailPosition(ofScope: "tvbCw", titles: visibleTitles)
                 return (entry.title, entry.epLabel,
                         rail.name,
                         "Dãy \(rail.pos) / \(total) · ↑ để trở lại")
@@ -1558,9 +1560,7 @@ struct JoePhimHomeCore: View {
                 return CinemaHeroResolved(
                     item: item, target: .movie(movie, scope: scope))
             }
-            if let title = pcTVBById.values.first(where: {
-                focusedMovie.hasSuffix("|\($0.tmdbId)")
-            }) {
+            if let title = joePCTVBTitle(forFocus: focusedMovie, in: pcTVBById) {
                 return CinemaHeroResolved(
                     item: JoeCinemaHeroItem(
                         key: focusedMovie,
@@ -1745,12 +1745,15 @@ struct JoePhimHomeCore: View {
     /// A rail counts only when it would render (non-empty
     /// data), mirroring each builder's own gate.
     private var cinemaVisibleRailTitles: [String] {
+        // claude/opt-2 (FL-447 R1): one railSpecs build per call
+        // (it was rebuilt at every read below).
+        let specs = railSpecs
         var titles: [String] = []
         if !movieProgress.isEmpty { titles.append("Xem tiếp") }
-        if let railSpec = railSpecs.first(where: { $0.scope == "trending" }),
+        if let railSpec = specs.first(where: { $0.scope == "trending" }),
            !railSpec.movies.isEmpty { titles.append("Trending") }
         for scope in ["kkNew", "vsNew", "f4kNew", "tpNew"] {
-            if let railSpec = railSpecs.first(where: { $0.scope == scope }),
+            if let railSpec = specs.first(where: { $0.scope == scope }),
                !railSpec.movies.isEmpty {
                 titles.append(cinemaProviderRailTitle(scope))
             }
@@ -1772,7 +1775,7 @@ struct JoePhimHomeCore: View {
         for rail in addonStore.rails where !rail.metas.isEmpty {
             titles.append(rail.catalog.name)
         }
-        for railSpec in railSpecs
+        for railSpec in specs
         where !railSpec.movies.isEmpty && !cinemaDesignScopes.contains(railSpec.scope) {
             titles.append(railSpec.title)
         }
@@ -1784,12 +1787,15 @@ struct JoePhimHomeCore: View {
     /// own gates — the strip's denominator and the
     /// tagline's count while the Phim section is active.
     private var cinemaPhimVisibleRailTitles: [String] {
+        // claude/opt-2 (FL-447 R1): one railSpecs build per call
+        // (it was rebuilt at every read below).
+        let specs = railSpecs
         var titles: [String] = []
         if !movieProgress.isEmpty { titles.append("Xem tiếp") }
-        if let railSpec = railSpecs.first(where: { $0.scope == "trending" }),
+        if let railSpec = specs.first(where: { $0.scope == "trending" }),
            !railSpec.movies.isEmpty { titles.append("Trending") }
         for scope in ["kkNew", "vsNew", "f4kNew", "tpNew"] {
-            if let railSpec = railSpecs.first(where: { $0.scope == scope }),
+            if let railSpec = specs.first(where: { $0.scope == scope }),
                !railSpec.movies.isEmpty {
                 titles.append(cinemaProviderRailTitle(scope))
             }
@@ -1807,9 +1813,12 @@ struct JoePhimHomeCore: View {
 
     /// A scope's (position, name) inside the visible PC
     /// rail list, for the strip's "Dãy NN/TT" line.
-    private func cinemaRailPosition(ofScope scope: String)
+    private func cinemaRailPosition(ofScope scope: String,
+                                    titles known: [String]? = nil)
         -> (pos: String, name: String) {
-        let titles = cinemaActiveRailTitles
+        // claude/opt-2 (FL-447 R1): a caller that already
+        // holds the visible-rail list passes it in.
+        let titles = known ?? cinemaActiveRailTitles
         let name: String
         switch scope {
         case "trending": name = "Trending"
@@ -1842,9 +1851,10 @@ struct JoePhimHomeCore: View {
     /// "Torrent" up in a list that only ever carries
     /// catalogue names, so rails 9–11 always painted
     /// "Dãy 01 · Torrent".
-    private func cinemaTorrentRailPosition(forFocusedMovie focused: String)
+    private func cinemaTorrentRailPosition(forFocusedMovie focused: String,
+                                           titles known: [String]? = nil)
         -> (pos: String, name: String) {
-        let titles = cinemaActiveRailTitles
+        let titles = known ?? cinemaActiveRailTitles
         if focused.hasPrefix("torCat:") {
             let catId = focused.dropFirst("torCat:".count)
                 .split(separator: "|").first.map(String.init) ?? ""
@@ -1953,10 +1963,15 @@ struct JoePhimHomeCore: View {
                 // below still resolves the featured title's
                 // TMDB backdrop / detail / rating — the
                 // resolver reads them for the featured item.
-                JoeCinemaBackdropLayer(controller: cinemaBackdrop)
-                .frame(maxWidth: .infinity)
-                .frame(height: stage)
-                .clipped()
+                // claude/opt-2 (FL-457): the stage is TEXT-ONLY — the
+                // backdrop and its scrims moved to page level
+                // (joePCPageBackdrop on the scroll view). This clear
+                // spacer keeps the stage's full-width frame, so the
+                // text, the tagline anchor and the strip below sit
+                // exactly where they did.
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: stage)
                 // FIX-214 (FULL-THEME-AUDIT-214 Phần C họ
                 // 1): the design's TWO scrims — the Ink
                 // stop ramps (JoeCinemaScrims), shared by
@@ -1964,8 +1979,6 @@ struct JoePhimHomeCore: View {
                 // five-stop BLACK left gradient + a
                 // clear→bg bottom ramp) was a different
                 // colour family from the drawing.
-                Rectangle().fill(JoeCinemaScrims.left)
-                Rectangle().fill(JoeCinemaScrims.bottom)
                 // FIX-213 (Fault 8): NO top scrim — the
                 // design draws exactly two scrims on this
                 // stage (left + bottom); the third one that
@@ -3896,6 +3909,22 @@ struct JoeRailSpec: Identifiable {
     var bandName: String? = nil
     var bandNote: String? = nil
     var id: String { scope }
+}
+
+/// claude/opt-2 (FL-447 R1): the TVB title a Private Cinema
+/// focus ID names, by direct key. Replaces
+/// `byId.values.first { focus.hasSuffix("|\($0.tmdbId)") }` —
+/// a scan of up to 1 873 titles on every focus move — with
+/// the same answer: byId is built with uniqueKeysWithValues
+/// keyed by each title's own tmdbId, and `focus` ends with
+/// "|<decimal tmdbId>" exactly when the text after its last
+/// "|" is that id's canonical decimal form.
+func joePCTVBTitle(forFocus focus: String,
+                   in byId: [Int: TVBTitle]) -> TVBTitle? {
+    guard let bar = focus.lastIndex(of: "|") else { return nil }
+    let tail = String(focus[focus.index(after: bar)...])
+    guard let id = Int(tail), String(id) == tail else { return nil }
+    return byId[id]
 }
 
 @MainActor

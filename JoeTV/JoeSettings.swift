@@ -665,7 +665,16 @@ struct JoeSettingsView: View {
                         pcCategoryPane
                             .id("joePCSettingsTop")
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            // claude/opt-2 (owner photo 2026-11-22: "bị cắt
+                            // khung"): the focused card's outset ring + scale
+                            // reach past this scroll view's clipping frame, so the
+                            // outermost card lost part of its frame. The content
+                            // is inset 16 and the scroll view widened by the same
+                            // 16 on both sides: the clip edge moves out, every
+                            // card stays exactly where it was (net geometry 0).
+                            .padding(.horizontal, 16)
                     }
+                    .padding(.horizontal, -16)
                     .focusSection()
                 }
             }
@@ -1051,7 +1060,41 @@ struct JoeSettingsView: View {
                 .foregroundStyle(theme.text)
             HStack(alignment: .center, spacing: 16) {
                 Group {
-                    if secure {
+                    if theme.id == .privateCinema {
+                        // claude/opt-2 (owner photo 2026-11-22,
+                        // FL-423 follow-up): under Private Cinema
+                        // the system still painted its OWN rounded
+                        // text-field pill inside the theme's bar
+                        // even with .textFieldStyle(.plain), so
+                        // every field read as a bar with a second
+                        // capsule in it. The bar now shows ONLY
+                        // the app's own text line: the value (or,
+                        // for a secret, the bullet row the secure
+                        // branch below already paints). The real
+                        // TextField / SecureField stays in place,
+                        // full size, for focus, the tvOS keyboard
+                        // and the iPhone-keyboard hand-off — at
+                        // 3 % opacity (UIKit drops a view from
+                        // focus/hit-testing only below 1 %), so
+                        // its pill no longer shows. Legacy themes
+                        // keep the branch below unchanged.
+                        ZStack(alignment: .leading) {
+                            Text(secure
+                                 ? String(repeating: "•",
+                                          count: min(text.wrappedValue.count, 40))
+                                 : text.wrappedValue)
+                                .lineLimit(1)
+                                .allowsHitTesting(false)
+                            Group {
+                                if secure {
+                                    SecureField("", text: text)
+                                } else {
+                                    TextField("", text: text)
+                                }
+                            }
+                            .opacity(0.03)
+                        }
+                    } else if secure {
                         // v2.0.3: a secure field's own masked
                         // rendering drops out while focus moves
                         // or the page scrolls (tvOS redraws the
@@ -1608,8 +1651,10 @@ private struct PCCategoryRowLabel: View {
         // already did) — the approved demo draws the row
         // [SIDE, SIDE+390], not 440.
         .frame(width: 390, alignment: .leading)
+        // claude/opt-2 (FL-422): the selected Panel face only
+        // while NOT focused — focus is the ivory outset ring.
         .background(RoundedRectangle(cornerRadius: 14)
-            .fill(selected ? theme.surface2 : Color.clear))
+            .fill(selected && !isFocused ? theme.surface2 : Color.clear))
         // Fault 11 fix round: the drawn Settings rail focus
         // is an ivory OUTSET outline around the row (the
         // build-Settings render's focused "Giao diện" row),

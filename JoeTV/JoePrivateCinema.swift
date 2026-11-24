@@ -97,6 +97,297 @@ extension View {
     }
 }
 
+/// claude/opt-2 (FL-427, pinned state): the band cover for a
+/// Private Cinema home's pinned context strip.
+///
+/// Mechanism of the fault: joePCBarInset reserves the bar's
+/// height with a CLEAR safeAreaInset, and a scroll view's
+/// content keeps scrolling UNDER its insets. Once the strip
+/// pins, the rails therefore slide up behind the transparent
+/// bar and through any gap above the strip, so rail titles
+/// paint over whatever is behind (the poster backdrop). The
+/// deep-state drawing (RECALC-SPEC §3.0 / §3.1 "Trạng thái
+/// sâu"; TRIAL-Home-recalc-deep.png, measured: y0–131 flat
+/// Ink #0C1215, strip y132–219 Ink) has NOTHING above the
+/// strip but flat Ink under the bar's own text.
+///
+/// The cover is paint only (no state, no preference writes,
+/// so no layout feedback): a GeometryReader in the strip's
+/// background reads the strip's global frame; while the strip
+/// sits at the pinned position (its top within the band
+/// threshold below — the rest position is the hero stage's
+/// foot, 560/600, far below it) it paints theme.bg (Ink) from
+/// the screen's top edge down to the strip's bottom, across
+/// the full 1920 canvas. The shell draws the bar ABOVE the
+/// content, so the wordmark, nav and clock stay on top. At
+/// rest it paints nothing, so the hero/backdrop at rest is
+/// untouched.
+/// claude/opt-2 (owner, 2026-11-22: "backdrop bị 1 thanh
+/// ngang màu đen … làm theo dạng thanh kính để không bị
+/// che"): the Private Cinema context strip and the pinned
+/// band above it are GLASS, not opaque Ink. Once the backdrop
+/// became full screen (FL-457) the opaque 88 pt strip read as
+/// a black bar laid across the art. The glass is the system
+/// ultra-thin material (frosted: the art stays visible, rail
+/// text behind it is blurred illegible) under a light Ink
+/// tint for the strip's own text. One definition for the four
+/// homes' strips and the pinned band cover. Paint only.
+///
+/// claude/opt-2 (owner log 2026-11-22: "lag 1 chút xíu so với
+/// cái cũ"): a live material blur re-samples everything
+/// behind it on every frame. At rest nothing moves behind the
+/// strip, so the strip itself is a plain tinted glass
+/// (`frosted: false`, no blur, Ink 0.5). The frosted material
+/// is used ONLY by the pinned band cover, which paints solely
+/// while the strip is pinned and rails scroll beneath it; it
+/// covers the strip's own area too, so the pinned strip reads
+/// as frosted glass and rail text behind it stays illegible.
+/// Owner's strip (2026-11-23): NOT a bar — one streak from the left. The veil
+/// hugs the measured text block exactly (this view is the text block's
+/// background, extended by `tail` on the trailing side); the extension is the
+/// fade zone: the veil holds solid behind the text itself, then dissolves
+/// gradually across the whole tail and disappears completely. The text is
+/// never masked — only the veil fades.
+struct JoeCinemaStreak: View {
+    @Environment(\.joeTheme) private var theme
+    var tail: CGFloat = 460
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let solid = w > tail ? (w - tail) / w : 0
+            let tailFrac = w > tail ? tail / w : 1
+            ZStack {
+                theme.bg.opacity(0.30)
+                LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0)],
+                               startPoint: .top, endPoint: .bottom)
+            }
+            .mask {
+                // Cách C3 (owner polish): eased multi-stop fade — solid to
+                // the end of the text, then 55% / 22% / gone, so the tail
+                // dissolves softly instead of one straight ramp.
+                LinearGradient(stops: [
+                    Gradient.Stop(color: .black, location: 0),
+                    Gradient.Stop(color: .black, location: solid),
+                    Gradient.Stop(color: .black.opacity(0.55), location: solid + 0.45 * tailFrac),
+                    Gradient.Stop(color: .black.opacity(0.22), location: solid + 0.78 * tailFrac),
+                    Gradient.Stop(color: .clear, location: 1),
+                ], startPoint: .leading, endPoint: .trailing)
+            }
+            .mask {
+                LinearGradient(stops: [
+                    Gradient.Stop(color: .clear, location: 0),
+                    Gradient.Stop(color: .black, location: 0.22),
+                    Gradient.Stop(color: .black, location: 0.78),
+                    Gradient.Stop(color: .clear, location: 1),
+                ], startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+struct JoeCinemaGlass: View {
+    var frosted: Bool = false
+    @Environment(\.joeTheme) private var theme
+
+    var body: some View {
+        ZStack {
+            if frosted {
+                Rectangle().fill(.ultraThinMaterial)
+                theme.bg.opacity(0.35)
+            } else {
+                // claude/opt-2 (owner 2026-11-22 23:08: "hiệu ứng
+                // gương khi đang ở trên rail đầu tiên, để nó không
+                // bị che hoàn toàn backdrop"): at rest the strip is
+                // a light MIRROR glass, not a tinted band — a faint
+                // Ink veil for the text, a soft sheen falling from
+                // the top edge and hairline edges top and bottom.
+                // The backdrop reads through it. The darker pinned
+                // look is painted by the pinned band cover instead
+                // (see JoePCPinnedBandCover), unchanged.
+                theme.bg.opacity(0.15)
+                LinearGradient(colors: [Color.white.opacity(0.08),
+                                        Color.white.opacity(0.0)],
+                               startPoint: .top, endPoint: .bottom)
+                VStack(spacing: 0) {
+                    Color.white.opacity(0.14).frame(height: 1)
+                    Spacer(minLength: 0)
+                    Color.white.opacity(0.10).frame(height: 1)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+let joePCPinnedStripThreshold: CGFloat = 330
+
+/// Cách C2 (owner, 2026-11-23): the strip publishes the measured width of its
+/// text block; the pinned cover sizes its streak from that number (+ a fade
+/// tail) instead of a fixed length — short title, short streak; long title,
+/// long streak. ("làm nó dạng fade theo độ dài của chữ title")
+struct JoePCStripTextWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// claude/strip-legibility: the pinned strip's text-line hold —
+/// the vertical opacity profile of the Ink overlay that keeps the
+/// title/meta line at the eyebrow line's density (see the call in
+/// JoePCPinnedBandCover). Pure arithmetic on layout values the
+/// cover already reads; no state, no per-focus work.
+enum JoePCStripHold {
+    /// Glass Ink tint inside JoeCinemaGlass(frosted: true).
+    static let glassInk: Double = 0.35
+    /// The baseline strip overlay (top of the strip).
+    static let topOverlay: Double = 0.5
+    /// Density the eyebrow line already gets: 1 − 0.65 × 0.5.
+    static let target: Double = 1 - (1 - glassInk) * (1 - topOverlay)
+    /// Fade below the text block: 40 pt past the strip's bottom
+    /// edge, so the hold's fade (text bottom → skirt end, 50 pt on
+    /// an 88 pt strip) has the same slope as the glass's own
+    /// baseline dissolve (0.675 over 52 pt) — no new cut line.
+    static let skirt: CGFloat = 40
+
+    /// The glass's own bottom-dissolve mask value at strip-local y
+    /// (1 down to 78 % of the cover, then linear to 0).
+    static func glassMask(y: CGFloat, stripHeight h: CGFloat, above: CGFloat) -> Double {
+        let coverH = above + h
+        guard coverH > 0 else { return 0 }
+        let f = Double((above + y) / coverH)
+        return f <= 0.78 ? 1 : max(0, (1 - f) / 0.22)
+    }
+
+    /// Overlay opacity that makes glass + overlay = target.
+    static func overlay(atGlassMask m: Double) -> Double {
+        min(target, max(0, 1 - (1 - target) / (1 - glassInk * m)))
+    }
+
+    static func stops(stripHeight h: CGFloat, above: CGFloat,
+                      ink: Color) -> [Gradient.Stop] {
+        let total = h + skirt
+        guard h > 0 else { return [Gradient.Stop(color: .clear, location: 0)] }
+        // Text block (eyebrow 15 + 4 + title 34 ≈ 66 pt) is centred
+        // in the strip: its bottom sits at h/2 + 33; +1 for descenders.
+        let holdEnd = min(h, h / 2 + 34)
+        let coverH = above + h
+        let dStart = min(holdEnd, max(0, 0.78 * coverH - above))
+        func stop(_ y: CGFloat, _ o: Double) -> Gradient.Stop {
+            Gradient.Stop(color: ink.opacity(o), location: y / total)
+        }
+        let mid = dStart + (holdEnd - dStart) / 2
+        let oMid = overlay(atGlassMask: glassMask(y: mid, stripHeight: h, above: above))
+        let oEnd = overlay(atGlassMask: glassMask(y: holdEnd, stripHeight: h, above: above))
+        let tail = total - holdEnd
+        return [
+            stop(0, topOverlay),
+            stop(dStart, topOverlay),
+            stop(mid, oMid),
+            stop(holdEnd, oEnd),
+            stop(holdEnd + 0.45 * tail, oEnd * 0.55),
+            stop(holdEnd + 0.78 * tail, oEnd * 0.22),
+            stop(total, 0),
+        ]
+    }
+}
+
+private struct JoePCPinnedBandCover: ViewModifier {
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.backgroundPreferenceValue(JoePCStripTextWidthKey.self) { textW in
+                GeometryReader { geo in
+                    let frame = geo.frame(in: .global)
+                    let pinned = frame.minY <= joePCPinnedStripThreshold
+                    let above = max(0, frame.minY)
+                    // claude/opt-2: glass, not Ink (see JoeCinemaGlass).
+                    // Owner's strip (2026-11-23): pinned is the same ONE
+                    // streak — frosted glass from the left edge, solid
+                    // across the longest-title zone, then a long soft fade
+                    // to nothing. No right patch, no full-width slab.
+                    // Cách C2: streak length follows the measured title —
+                    // solid from the screen edge to the end of the text
+                    // block (frame.minX + the strip's 14pt leading pad +
+                    // textW), then the fade tail; fixed 1560/0.60 only as
+                    // the pre-measure fallback.
+                    let textEnd = frame.minX + 14 + textW
+                    let streakW = textW > 0 ? min(1920, textEnd + 340) : 1560
+                    let solidAt = textW > 0 ? min(0.85, textEnd / streakW) : 0.60
+                    let fadeSpan = 1 - solidAt
+                    let hMask = LinearGradient(stops: [
+                        // Cách C3: same eased profile as the at-rest streak.
+                        Gradient.Stop(color: .black, location: 0),
+                        Gradient.Stop(color: .black, location: solidAt),
+                        Gradient.Stop(color: .black.opacity(0.55), location: solidAt + 0.45 * fadeSpan),
+                        Gradient.Stop(color: .black.opacity(0.22), location: solidAt + 0.78 * fadeSpan),
+                        Gradient.Stop(color: .clear, location: 1),
+                    ], startPoint: .leading, endPoint: .trailing)
+                    let coverH = above + frame.height
+                    ZStack(alignment: .topLeading) {
+                        // The frosted streak — baseline geometry and
+                        // masks unchanged; only the Ink 0.5 strip
+                        // overlay moved out of it (see the hold below).
+                        JoeCinemaGlass(frosted: true)
+                            .frame(width: streakW, height: pinned ? coverH : 0)
+                            .mask { hMask }
+                            .mask {
+                                // Cách C3: bottom edge dissolves over the last
+                                // 22% (was 10%) — no visible cut line over the
+                                // posters below the pinned strip.
+                                LinearGradient(stops: [
+                                    Gradient.Stop(color: .black, location: 0),
+                                    Gradient.Stop(color: .black, location: 0.78),
+                                    Gradient.Stop(color: .clear, location: 1),
+                                ], startPoint: .top, endPoint: .bottom)
+                            }
+                        // claude/strip-legibility: the text-line hold.
+                        // Pre-fix the Ink 0.5 strip overlay sat INSIDE
+                        // the 22% bottom dissolve above, and with the
+                        // strip pinned under the 148 pt bar that
+                        // dissolve begins ~36 pt into the 88 pt strip —
+                        // exactly the title/meta line, which therefore
+                        // got ~0.43 → 0.24 cover density instead of
+                        // the 0.675 the eyebrow line gets: the washout
+                        // over bright posters. The hold paints the
+                        // overlay on its own vertical profile, sized so
+                        // glass + hold = the eyebrow line's 0.675 all
+                        // the way down to the text block's bottom, then
+                        // the house eased fade (×.55 / ×.22 / 0) over a
+                        // 40 pt skirt. Same horizontal streak mask. No
+                        // new density level, no new shape.
+                        LinearGradient(
+                            stops: JoePCStripHold.stops(
+                                stripHeight: frame.height, above: above,
+                                ink: theme.bg),
+                            startPoint: .top, endPoint: .bottom)
+                            .frame(width: streakW,
+                                   height: pinned ? frame.height + JoePCStripHold.skirt : 0)
+                            .mask { hMask }
+                            .padding(.top, pinned ? above : 0)
+                    }
+                    .frame(width: 1920,
+                           height: pinned ? coverH + JoePCStripHold.skirt : 0,
+                           alignment: .topLeading)
+                    .offset(x: -frame.minX, y: -above)
+                    .allowsHitTesting(false)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPinnedBandCover() -> some View {
+        modifier(JoePCPinnedBandCover())
+    }
+}
+
 // MARK: - Design top bar pieces (FIX-213, Fault 8)
 //
 // The Private Cinema design set's own header (measured
@@ -163,7 +454,7 @@ struct PCNavLabel: View {
                     .font(.system(size: 20))
             }
             Text(title)
-                .font(JoePCType.outfit(24))
+                .font(JoePCType.outfit(24, weight: selected ? .semibold : .regular))
         }
         // FIX-214 (owner ruling 2026-11-22 14:46 CST —
         // Chỉ thị 10): menu focus is the RING ONLY. While
@@ -178,13 +469,18 @@ struct PCNavLabel: View {
         // selected + focused item wore fill AND ring
         // while its neighbour wore ring only — the
         // desync in the owner's clip.)
-        .foregroundStyle(selected && !isFocused ? theme.bg : theme.text)
+        // claude/opt-2 (FL-422, owner ruling): the nav fill is
+        // GONE at every state — no ivory capsule, selected or
+        // not, focused or not. Selected is carried by the text
+        // alone (semibold, see the font below); focus stays the
+        // celadon ring + scale. The 13 × 27 padding is kept so
+        // the ring's geometry and the bar's spacing are
+        // unchanged.
+        .foregroundStyle(theme.text)
         .lineLimit(1)
         .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 27)
         .padding(.vertical, 13)
-        .background(Capsule().fill(selected && !isFocused
-                                   ? theme.text : Color.clear))
         .overlay {
             if isFocused {
                 Capsule()
@@ -229,6 +525,26 @@ enum JoeCinemaScrims {
         ], startPoint: .leading, endPoint: .trailing)
     }
 
+    /// claude/opt-2 (FL-457, owner ruling): the vertical scrim
+    /// of the FULL-SCREEN page backdrop. The design's stage
+    /// ramp (`bottom` below) ended at 0x1F Ink on the stage's
+    /// foot, which is the hard cut the owner rejected once
+    /// the art runs the whole screen. This ramp takes the
+    /// melt of the theme's own full-screen detail backdrop
+    /// (JoeMovieDetail.cinemaBackdrop: clear by 0.35, bg 0.88
+    /// at 0.85, full bg at the bottom) so the rails sit on
+    /// near-full Ink. Its top stays CLEAR (not the detail's
+    /// 0.30): FIX-213 Fault 8 ruled out any top darkening of
+    /// the art under the bar ("Làm che luôn backdrop").
+    static var page: LinearGradient {
+        LinearGradient(stops: [
+            .init(color: ink.opacity(0), location: 0),
+            .init(color: ink.opacity(0), location: 0.35),
+            .init(color: ink.opacity(0.88), location: 0.85),
+            .init(color: ink.opacity(1), location: 1)
+        ], startPoint: .top, endPoint: .bottom)
+    }
+
     static var bottom: LinearGradient {
         LinearGradient(stops: [
             .init(color: ink.opacity(50.0 / 255.0), location: 0),
@@ -252,6 +568,21 @@ enum JoeCinemaScrims {
 // stand-in — the compression then errs toward MORE air,
 // never toward the overlap this budget exists to kill).
 enum JoeHeroMeasure {
+    // claude/opt-2 (FL-447 R2): the hero bodies call these on
+    // every render — i.e. on every focus move — and each call
+    // did a UIFont(name:) lookup plus an NSString text layout.
+    // Both answers depend only on (text, face, size, width),
+    // and the bundled faces are registered once at launch
+    // (UIAppFonts), so the results are memoised. NSCache is
+    // thread-safe and evicts under memory pressure; a miss
+    // runs the original computation unchanged.
+    private nonisolated(unsafe) static let linesMemo: NSCache<NSString, NSNumber> = {
+        let cache = NSCache<NSString, NSNumber>()
+        cache.countLimit = 512
+        return cache
+    }()
+    private nonisolated(unsafe) static let lineHeightMemo = NSCache<NSString, NSNumber>()
+
     private static func font(_ postScriptName: String,
                              _ size: CGFloat) -> UIFont {
         UIFont(name: postScriptName, size: size)
@@ -263,17 +594,27 @@ enum JoeHeroMeasure {
     static func lines(of text: String, postScriptName: String,
                       size: CGFloat, width: CGFloat) -> Int {
         guard !text.isEmpty else { return 0 }
+        let key = "\(postScriptName)|\(size)|\(width)|\(text)" as NSString
+        if let hit = linesMemo.object(forKey: key) { return hit.intValue }
         let f = font(postScriptName, size)
         let rect = (text as NSString).boundingRect(
             with: CGSize(width: width, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: [.font: f], context: nil)
-        return max(1, Int(ceil(rect.height / f.lineHeight)))
+        let count = max(1, Int(ceil(rect.height / f.lineHeight)))
+        linesMemo.setObject(NSNumber(value: count), forKey: key)
+        return count
     }
 
     static func lineHeight(postScriptName: String,
                            size: CGFloat) -> CGFloat {
-        font(postScriptName, size).lineHeight
+        let key = "\(postScriptName)|\(size)" as NSString
+        if let hit = lineHeightMemo.object(forKey: key) {
+            return CGFloat(hit.doubleValue)
+        }
+        let height = font(postScriptName, size).lineHeight
+        lineHeightMemo.setObject(NSNumber(value: Double(height)), forKey: key)
+        return height
     }
 }
 
@@ -671,7 +1012,8 @@ final class JoeCinemaBackdropController: ObservableObject {
         defer { backdropTask.cancel(); hedgeTask.cancel() }
         while !box.settled {
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the box.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
         if let win = box.winner {
             return (win.image, win.source)
@@ -768,6 +1110,9 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
     private var posterClaimed = false
     private var backdropDone = false
     private var posterDone: Bool
+    /// Wakes loadBackdrop's wait loop whenever the settled
+    /// state can have changed (claude/opt-1).
+    let wake = JoeWake()
 
     init(posterLegExists: Bool) {
         posterDone = !posterLegExists
@@ -779,6 +1124,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         if leg == .backdrop { backdropDone = true }
         if leg == .poster { posterDone = true }
         lock.unlock()
+        wake.signal()
     }
 
     /// The backdrop leg finished with NO bitmap. Its
@@ -790,6 +1136,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         backdropDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// The CLAIMED poster leg finished with NO bitmap
@@ -800,6 +1147,7 @@ private final class JoeBackdropRaceBox: @unchecked Sendable {
         lock.lock()
         posterDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// True exactly once — for the leg that runs the
@@ -854,6 +1202,67 @@ struct JoeCinemaBackdropLayer: View {
                     .opacity(controller.topOpacity)
             }
         }
+    }
+}
+
+/// claude/opt-2 (FL-457, owner ruling): the Private Cinema
+/// home's FULL-SCREEN backdrop. The owner's standard
+/// overrides RECALC-SPEC's confined hero stage: the art
+/// fills the whole screen like the original theme and like
+/// the detail backdrops. This is the same focus-follows
+/// controller and crossfade layer the hero stage carried,
+/// hoisted to page level BEHIND the home's ScrollView
+/// (mounted with .background, ignoring the safe area), under
+/// the design's left scrim and the full-height `page` ramp.
+/// The hero stage above it is now text-only at its unchanged
+/// 560/600 frame; the pinned strip keeps its opaque Ink.
+struct JoeCinemaPageBackdrop: View {
+    @ObservedObject var controller: JoeCinemaBackdropController
+
+    var body: some View {
+        ZStack {
+            JoeCinemaBackdropLayer(controller: controller)
+            Rectangle().fill(JoeCinemaScrims.left)
+            Rectangle().fill(JoeCinemaScrims.page)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        // claude/opt-2 (owner log 2026-11-22, lag vs 2.1.4):
+        // the full-screen backdrop now sits under the rails
+        // the whole time you browse, so every scroll frame
+        // re-blended the bitmap(s) + two full-screen gradients.
+        // drawingGroup flattens the stack into ONE offscreen-
+        // rendered layer that is redrawn only when its content
+        // changes (a new backdrop / the crossfade), not per
+        // scroll frame. Same pixels.
+        .drawingGroup()
+        .clipped()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Mounts JoeCinemaPageBackdrop behind a home's scroll view,
+/// Private Cinema only (other themes: unchanged).
+private struct JoePCPageBackdrop: ViewModifier {
+    @ObservedObject var controller: JoeCinemaBackdropController
+    @Environment(\.joeTheme) private var theme
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if theme.id == .privateCinema {
+            content.background {
+                JoeCinemaPageBackdrop(controller: controller)
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func joePCPageBackdrop(_ controller: JoeCinemaBackdropController) -> some View {
+        modifier(JoePCPageBackdrop(controller: controller))
     }
 }
 

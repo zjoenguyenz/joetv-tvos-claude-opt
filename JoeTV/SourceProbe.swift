@@ -108,7 +108,8 @@ enum SourceProbe {
                 return Result(name: "KKPhim", ok: false, millis: ms,
                                   note: "Đã huỷ")
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the box.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
     }
 
@@ -145,23 +146,28 @@ private final class KKProbeBox: @unchecked Sendable {
 
     private let lock = NSLock()
     private var result: Outcome?
+    /// Wakes probeKK's wait loop on publication (claude/opt-1).
+    let wake = JoeWake()
 
     func complete(_ n: Int) {
         lock.lock()
         if result == nil { result = .count(n) }
         lock.unlock()
+        wake.signal()
     }
 
     func fail() {
         lock.lock()
         if result == nil { result = .failed }
         lock.unlock()
+        wake.signal()
     }
 
     func expire() {
         lock.lock()
         if result == nil { result = .expired }
         lock.unlock()
+        wake.signal()
     }
 
     var outcome: Outcome? {
