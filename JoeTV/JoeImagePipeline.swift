@@ -773,6 +773,20 @@ struct JoeRemoteImage<Placeholder: View>: View {
     /// The first paint is never blocked: until an accepted
     /// bitmap exists the placeholder paints.
     private func resolve() async -> UIImage? {
+        // claude/opt-1 (OPTIMIZATION-AUDIT item 2): warm fast
+        // path. When the decoded cache already holds an
+        // accepted primary bitmap, the race below can only end
+        // one way — image(for:) returns this same cache hit
+        // at once, the primary leg accepts it and wins — so it
+        // is returned directly, with the same log line, instead
+        // of spawning the primary + hedge tasks and a wait loop
+        // for every warm card that scrolls back into view.
+        if let warm = JoeImagePipeline.shared.cachedImage(
+               for: url, targetPixels: targetPixels),
+           slotClass.accepts(warm) {
+            logResolve(leg: "primary", source: url, image: warm)
+            return warm
+        }
         let box = JoeResolveRaceBox()
         // Gate R2 fix (Lens A MINOR 2): the primary task
         // is STORED and cancelled by the same defer as the
@@ -807,7 +821,9 @@ struct JoeRemoteImage<Placeholder: View>: View {
         defer { hedge.cancel(); primary.cancel() }
         while !box.settled {
             if Task.isCancelled { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // claude/opt-1: same 50 ms ceiling, woken by the
+            // box the moment a leg publishes.
+            await box.wake.nap(nanoseconds: 50_000_000)
         }
         if let win = box.winner {
             logResolve(leg: win.leg, source: win.source, image: win.image)
@@ -908,6 +924,9 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
     private var primaryDone = false
     private var fallbackDone = false
     private var fbSource: URL?
+    /// Wakes resolve()'s wait loop whenever the box's
+    /// settled state can have changed (claude/opt-1).
+    let wake = JoeWake()
 
     func complete(image: UIImage, leg: String, source: URL?) {
         lock.lock()
@@ -915,6 +934,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         if leg == "primary" { primaryDone = true }
         if leg == "fallback" { fallbackDone = true }
         lock.unlock()
+        wake.signal()
     }
 
     /// The primary leg finished with NO accepted bitmap
@@ -928,6 +948,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         lock.lock()
         primaryDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// The CLAIMED fallback leg finished with NO accepted
@@ -938,6 +959,7 @@ private final class JoeResolveRaceBox: @unchecked Sendable {
         lock.lock()
         fallbackDone = true
         lock.unlock()
+        wake.signal()
     }
 
     /// True exactly once — for the leg that runs the

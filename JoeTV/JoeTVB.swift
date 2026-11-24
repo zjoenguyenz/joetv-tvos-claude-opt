@@ -732,8 +732,16 @@ struct JoeTVBView: View {
                         pcAppendSections(catalog)
                     } header: {
                         tvbContextStrip(catalog)
+                            // claude/opt-2 (FL-427): Ink above
+                            // the strip while it is pinned.
+                            .joePCPinnedBandCover()
                     }
-                    .background(theme.bg)
+                    // claude/opt-2 (FL-457, owner ruling): the
+                    // Section's plain Ink fill is removed — it
+                    // cut the full-screen page backdrop at the
+                    // hero's foot; the rails sit on the page
+                    // scrim's near-full Ink, as on the other
+                    // three homes.
                 } else if loadFailed {
                     Text("Không tải được danh sách TVB.")
                         .font(JoePCType.outfit(29))
@@ -763,6 +771,9 @@ struct JoeTVBView: View {
             .padding(.bottom, 64)
             }
             .joePCBarInset()
+            // claude/opt-2 (FL-457): the full-screen backdrop behind
+            // the whole page (Private Cinema only; see JoePrivateCinema).
+            .joePCPageBackdrop(tvbBackdrop)
             .onChange(of: topScrollSignal) { _, _ in
                 proxy.scrollTo("joeTVBHomeTop", anchor: .top)
             }
@@ -1020,19 +1031,20 @@ struct JoeTVBView: View {
     /// placement is replaced by this hero-zone layer.
     private func tvbHeroBlock(_ catalog: TVBCatalog) -> some View {
         ZStack(alignment: .bottomLeading) {
-            JoeCinemaBackdropLayer(controller: tvbBackdrop)
+            // claude/opt-2 (FL-457): the stage is TEXT-ONLY — the
+            // backdrop and its scrims moved to page level
+            // (joePCPageBackdrop on the scroll view). This clear
+            // spacer keeps the stage's full-width frame, so the
+            // text, the tagline anchor and the strip below sit
+            // exactly where they did.
+            Color.clear
                 .frame(maxWidth: .infinity)
-                // FIX-214 (DESIGN-PASS-214 §1a): stage
-                // 485 → 560, as on the Phim hero.
                 .frame(height: 560)
-                .clipped()
             // FIX-214 (FULL-THEME-AUDIT-214 Phần C họ 1):
             // the design's Ink scrims (JoeCinemaScrims),
             // shared by all three heroes — the shipped
             // pair was the same BLACK-gradient family as
             // the Phim hero's.
-            Rectangle().fill(JoeCinemaScrims.left)
-            Rectangle().fill(JoeCinemaScrims.bottom)
             // FIX-213 (Fault 8): NO top scrim — the
             // design draws exactly two scrims on this
             // stage (left + bottom); the third one that
@@ -1454,29 +1466,27 @@ struct JoeTVBView: View {
                     }
                 }
             }
-            Spacer()
-            // FIX-8 / C-R4-2: right side is the drawing's
-            // TWO-LINE block — rail name over the Dãy
-            // line, right-aligned (values unchanged from
-            // tvbContextInfo's derivations).
-            VStack(alignment: .trailing, spacing: 4) {
-                if !info.railName.isEmpty {
-                    Text(info.railName)
-                        .font(JoePCType.outfit(22))
-                        .foregroundStyle(theme.heroMeta)
-                        .lineLimit(1)
+            .background(alignment: .leading) {
+                JoeCinemaStreak()
+                    .padding(.vertical, -14)
+                    .padding(.leading, -100)
+                    .padding(.trailing, -460)
+            }
+            .background {
+                GeometryReader { g in
+                    Color.clear
+                        .preference(key: JoePCStripTextWidthKey.self, value: g.size.width)
                 }
-                Text(info.railLine)
-                    .font(JoePCType.outfit(22))
-                    .foregroundStyle(theme.meta)
-                    .lineLimit(1)
             }
         }
         .padding(.leading, 14)
         .padding(.trailing, 14)
         .frame(height: 88)
-        .frame(maxWidth: .infinity)
-        .background(theme.bg)
+        .frame(maxWidth: .infinity, alignment: .leading)  // Cach C fix: strip content hugs the left edge (Spacer removed with the right block)
+        // claude/opt-2 (owner: glass bar, not a black bar over
+        // the full-screen backdrop): JoeCinemaGlass, drawn edge
+        // to edge (background only, -80 over the safe-area inset;
+        // no layout change).
     }
 
     /// The strip's content for the TVB home: resolve the
@@ -1663,6 +1673,21 @@ struct JoeTVBView: View {
         var id: String { scope }
     }
 
+    /// claude/opt-2 (FL-447 R4): railSpecs(catalog) is a pure
+    /// function of the catalogue, and `catalog` is assigned
+    /// exactly once (loadCatalog's guard), yet the strip, the
+    /// tagline, the rails and the focus handler each rebuilt
+    /// it — decade grouping, four sorts and an actor index
+    /// over every displayed title — about seven times per
+    /// focus step. The first build is kept here and returned
+    /// while the catalogue key still matches. A reference
+    /// box, so filling it inside body is not a state write.
+    private final class RailSpecsMemo {
+        var key: String?
+        var specs: [RailSpec] = []
+    }
+    @State private var railSpecsMemo = RailSpecsMemo()
+
     /// The five pipeline rails in build order, then the
     /// Idea 1 rich shelves (2.0.25: decade shelves, Trọn bộ,
     /// Hay nhất, Nhiều phần — computed below from the
@@ -1670,6 +1695,16 @@ struct JoeTVBView: View {
     /// audit order. A rail renders only when it resolves to
     /// at least one displayed title.
     private func railSpecs(_ catalog: TVBCatalog) -> [RailSpec] {
+        let key = "\(catalog.version)|\(catalog.generatedAt)|\(catalog.titles.count)"
+        if railSpecsMemo.key == key { return railSpecsMemo.specs }
+        let built = buildRailSpecs(catalog)
+        railSpecsMemo.key = key
+        railSpecsMemo.specs = built
+        return built
+    }
+
+    /// The pre-opt-2 railSpecs body, verbatim.
+    private func buildRailSpecs(_ catalog: TVBCatalog) -> [RailSpec] {
         var specs = [
             RailSpec(scope: "dangHot", title: "🔥 Đang hot",
                      ids: catalog.rails.dangHot),
@@ -2342,7 +2377,14 @@ struct JoeTVBSearchView: View {
                     ytResultsGrid
                 }
             }
+            // claude/opt-2 (owner: focus frames cut at the
+            // edge): inset 16 + scroll widened 16, horizontally
+            // only, so the outermost card's ring + scale fit
+            // inside the clip (net geometry 0; the v2.0.16
+            // vertical clip rule below stands).
+            .padding(.horizontal, 16)
         }
+        .padding(.horizontal, -16)
         // v2.0.16: CLIPS at its frame, like the JoeSearch
         // grid it was templated from — this copy kept the
         // .scrollClipDisabled() the search fix removed, so

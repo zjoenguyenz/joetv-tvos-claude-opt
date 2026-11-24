@@ -223,19 +223,6 @@ final class JoeNavigator: ObservableObject {
     // ENTRY policy (the pill row's entry is the pill the user
     // left — see the pillFocus note in JoeRootView). The hub
     // stays removed and law D4 stands unchanged.
-
-    /// Close the topmost layer; returns false when nothing is
-    /// open (the caller then lets the system have the press).
-    func closeTop() -> Bool {
-        if ytSignInOpen { ytSignInOpen = false; return true }
-        if ytPlayer != nil { ytPlayer = nil; return true }
-        if addonDetail != nil { addonDetail = nil; return true }
-        if ytDetail != nil { ytDetail = nil; return true }
-        if movie != nil { movie = nil; return true }
-        if tor != nil { tor = nil; return true }
-        if searchOpen { searchOpen = false; return true }
-        return false
-    }
 }
 
 /// The shell (v1.4 rework): a single VStack — topBar (wordmark +
@@ -671,6 +658,11 @@ struct JoeRootView: View {
                 content
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .focusSection()
+                    // claude/opt-2 (FL-448 / Fault 6): INSTRUMENTATION
+                    // ONLY — logs an off-canvas content width
+                    // (JoePCWidthProbe); no geometry changes.
+                    .background(JoePCWidthProbe(surface: "content",
+                                                section: nav.section.rawValue))
                 // FIX-214 (Finding 12): while search is
                 // open the BAR cannot take focus (the
                 // 2.1.3 nesting: the shell stayed focusable
@@ -684,6 +676,8 @@ struct JoeRootView: View {
                 // the bar's pills go inert.
                 topBar
                     .disabled(nav.searchOpen)
+                    .background(JoePCWidthProbe(surface: "bar",
+                                                section: nav.section.rawValue))
             }
         } else {
             VStack(spacing: 32) {
@@ -1196,6 +1190,43 @@ struct JoeRootView: View {
     }
 }
 
+/// claude/opt-2 (FL-448 Fault 1 + Fault 6): INSTRUMENTATION
+/// ONLY. Candidate mechanism for the horizontal-only stretch
+/// on Private Cinema compositions: the PC shell is one
+/// ZStack holding the section content and the bar, and the
+/// content's .frame(maxWidth: .infinity) does not cap a
+/// child that insists on more than the proposed width. One
+/// over-wide child therefore widens the content frame and the
+/// shared ZStack, the shell centres it (corners fall off BOTH
+/// edges), and the bar, sized to that ZStack, spreads its
+/// wordmark and clock off-screen while the nav stays centred;
+/// vertical geometry is untouched. This probe paints nothing
+/// and changes no layout (a clear background GeometryReader);
+/// it writes ONE diagnostic line per off-canvas width change,
+/// so the next device run convicts or clears the mechanism.
+private struct JoePCWidthProbe: View {
+    let surface: String
+    let section: String
+
+    var body: some View {
+        GeometryReader { geo in
+            Color.clear
+                .onAppear { report(geo.size.width) }
+                .onChange(of: geo.size.width) { _, width in report(width) }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func report(_ width: CGFloat) {
+        // Inside the tvOS safe area the shell expects 1760;
+        // the full 1920 canvas is also legitimate. Anything
+        // wider than the canvas is the convicting reading.
+        guard width > 1921 else { return }
+        DiagLog.write("LAYOUT", "PC \(surface) width=\(Int(width.rounded())) section=\(section) (canvas 1920)")
+    }
+}
+
 /// The pill's label (convergence, Team 7 item 2): reads its OWN
 /// focus state from the environment — the focus engine writes
 /// `isFocused` into a focused view's subtree as a pure rendering
@@ -1230,10 +1261,13 @@ private struct PillLabel: View {
         // box-shadow: none), so the ring is an explicit
         // strokeBorder in the JoeChipLabel form, not
         // JoeFocusRing (which paints clear at rest).
-        .foregroundStyle(selected ? theme.onAccent : theme.text)
+        // claude/opt-2 (FL-422): the selected fill is suppressed while
+        // focused (PCNavLabel's selected && !isFocused rule), so
+        // focus is ring-only on a selected item too.
+        .foregroundStyle(selected && !isFocused ? theme.onAccent : theme.text)
         .padding(.horizontal, 30)
         .padding(.vertical, 15)
-        .background(Capsule().fill(selected ? theme.accent : theme.surface2))
+        .background(Capsule().fill(selected && !isFocused ? theme.accent : theme.surface2))
         .overlay(Capsule().strokeBorder(
             isFocused
                 ? (theme.id == .posterWall && selected

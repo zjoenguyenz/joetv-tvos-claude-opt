@@ -790,13 +790,17 @@ struct JoeChipLabel: View {
     private var cinemaBody: some View {
         Text(title)
             .font(JoePCType.outfit(24, weight: (selected || isFocused) ? .semibold : .medium))
-            .foregroundStyle(selected ? theme.onAccent : theme.text)
+            // claude/opt-2 (FL-422): selected fill (and its
+            // no-hairline rest) only while NOT focused — a
+            // focused selected chip looks like any focused
+            // chip: hairline face + the ivory outset ring.
+            .foregroundStyle(selected && !isFocused ? theme.onAccent : theme.text)
             .lineLimit(1)
             .padding(.horizontal, 22)
             .padding(.vertical, 11)
-            .background(Capsule().fill(selected ? theme.accent : theme.surface2))
+            .background(Capsule().fill(selected && !isFocused ? theme.accent : theme.surface2))
             .overlay(Capsule().strokeBorder(
-                selected ? .clear : theme.stroke, lineWidth: 1.5))
+                selected && !isFocused ? .clear : theme.stroke, lineWidth: 1.5))
             .overlay(JoeOutsetRing(shape: Capsule(),
                                    color: JoeCinemaFocus.ivory,
                                    lineWidth: 2, offset: 4))
@@ -814,11 +818,15 @@ struct JoeChipLabel: View {
         // text colour (the episode chip agrees).
         Text(title)
             .font(.system(size: 24, weight: (selected || isFocused) ? .semibold : .medium))
-            .foregroundStyle(selected ? theme.onAccent : theme.text)
+            // claude/opt-2 (FL-422): selected fill only while
+            // NOT focused. The ring below is unchanged,
+            // including the owner's v2.0.9 white frame for a
+            // selected + focused chip in design D.
+            .foregroundStyle(selected && !isFocused ? theme.onAccent : theme.text)
             .lineLimit(1)
             .padding(.horizontal, 22)
             .padding(.vertical, 11)
-            .background(Capsule().fill(selected ? theme.accent : theme.surface2))
+            .background(Capsule().fill(selected && !isFocused ? theme.accent : theme.surface2))
             // v2.0.9 (owner defect, theme D only): design D's
             // sheets draw .chip.sel (fill #FFD60A, box-shadow:
             // none) and .chip.focused (inset 6 pt #FFD60A ring)
@@ -1024,11 +1032,26 @@ struct JoeSettingsFieldChrome: ViewModifier {
             .padding(.trailing, filled ? 48 : 0)
             .background(RoundedRectangle(cornerRadius: radius)
                 .fill(theme.fieldBar))
+            // claude/opt-2 (FL-423, Ruling 22): under Private
+            // Cinema the Settings field is the drawing's
+            // SINGLE-layer bar — fieldBar #22312E, rField 12,
+            // the ✓ bare inside it — with NO frame of its own.
+            // Pre-fix it wore a 1.5 hairline at rest and, when
+            // focused, a celadon border on the bar's edge PLUS
+            // the celadon outline 6 pt outside it: the double
+            // frame the owner named ("khung thẻ của bản
+            // ultra"). Focus is now ONE celadon 2 pt stroke on
+            // the bar's own edge (the Ruling 17 on-the-bar
+            // form), nothing outside it. Every other theme's
+            // expression is unchanged (no border overlay; the
+            // shared JoeFieldFocusRing on the bar). The Search
+            // input keeps its own spec'd treatment in
+            // JoeFieldChrome (RECALC-SPEC §3.8), untouched.
             .overlay(RoundedRectangle(cornerRadius: radius)
-                .strokeBorder(pc ? (focused ? theme.accent2 : theme.stroke)
-                                 : .clear,
-                              lineWidth: pc ? 1.5 : 0))
-            .overlay(JoeFieldFocusRing(radius: radius, focused: focused))
+                .strokeBorder(pc && focused ? theme.accent2 : .clear,
+                              lineWidth: pc && focused ? 2 : 0))
+            .overlay(JoeFieldFocusRing(radius: radius,
+                                       focused: pc ? false : focused))
             .overlay(alignment: .trailing) {
                 if filled {
                     JoeSettingsFilledMark()
