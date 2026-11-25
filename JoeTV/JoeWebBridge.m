@@ -191,6 +191,11 @@ static BOOL (^JoeRemotePressConsumer)(NSInteger pressType) = nil;
 @property (nonatomic, strong) JoeWebNavDelegate *navDelegate;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, copy, nullable) NSString *pollJavaScript;
+/// MinterLockdown: YES between -loadHTMLString:… and the
+/// first main-frame policy decision for its base URL — the
+/// one navigation the mode lets through.
+@property (nonatomic) BOOL minterInitialLoadPending;
+@property (nonatomic, copy, nullable) NSString *minterBaseHost;
 - (BOOL)joe_allowNavigationAction:(id)navigationAction;
 - (void)joe_loadFinished;
 - (void)joe_loadFailedWithError:(NSError *)error;
@@ -444,6 +449,81 @@ static BOOL (^JoeRemotePressConsumer)(NSInteger pressType) = nil;
                  request);
 }
 
+// The minter's content rule list: block every subresource
+// type a page can request. "document" is deliberately absent
+// so the local main document (an HTML string, not a network
+// load) is never at the blocker's mercy; subframe documents
+// are refused by the MinterLockdown navigation policy anyway.
+// Only types that compile on every tvOS WebKit since 11 are
+// listed ("raw" covers XHR/fetch/beacons/websockets there).
+static NSString * const JoeMinterBlockAllRules =
+    @"[{\"trigger\":{\"url-filter\":\".*\",\"resource-type\":"
+     "[\"image\",\"style-sheet\",\"script\",\"font\",\"raw\","
+     "\"svg-document\",\"media\",\"popup\"]},"
+     "\"action\":{\"type\":\"block\"}}]";
+
+- (void)loadHTMLString:(NSString *)html
+         baseURLString:(NSString *)baseURLString
+             userAgent:(nullable NSString *)userAgent {
+    if (self.webView == nil) {
+        [self.delegate joeHost:self
+            didFailLoadWithMessage:@"webview-unavailable"];
+        return;
+    }
+    if (self.navigationMode != JoeWebNavigationModeMinterLockdown) {
+        [self.delegate joeHost:self
+            didFailLoadWithMessage:@"minter-mode-required"];
+        return;
+    }
+    NSURL *baseURL = [NSURL URLWithString:baseURLString];
+    if (baseURL == nil || baseURL.host.length == 0) {
+        [self.delegate joeHost:self didFailLoadWithMessage:@"bad-url"];
+        return;
+    }
+    JoeMsgVoidId(self.webView,
+                 NSSelectorFromString(@"setCustomUserAgent:"), userAgent);
+    Class storeClass = JoeWKClass(@"WKContentRuleListStore");
+    id store = storeClass != Nil
+        ? JoeMsgId0(storeClass, NSSelectorFromString(@"defaultStore"))
+        : nil;
+    SEL compileSel = NSSelectorFromString(
+        @"compileContentRuleListForIdentifier:encodedContentRuleList:completionHandler:");
+    if (store == nil || ![store respondsToSelector:compileSel]) {
+        [self.delegate joeHost:self
+            didFailLoadWithMessage:@"minter-blocker-unavailable"];
+        return;
+    }
+    __weak JoeWebHostView *weakSelf = self;
+    void (^compiled)(id, NSError *) = [^(id ruleList, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            JoeWebHostView *strongSelf = weakSelf;
+            if (strongSelf == nil || strongSelf.webView == nil) { return; }
+            id config = JoeMsgId0(strongSelf.webView,
+                                  NSSelectorFromString(@"configuration"));
+            id ucc = config != nil
+                ? JoeMsgId0(config, NSSelectorFromString(@"userContentController"))
+                : nil;
+            SEL addSel = NSSelectorFromString(@"addContentRuleList:");
+            if (ruleList == nil || error != nil || ucc == nil
+                || ![ucc respondsToSelector:addSel]) {
+                [strongSelf.delegate joeHost:strongSelf
+                    didFailLoadWithMessage:@"minter-blocker-unavailable"];
+                return;
+            }
+            JoeMsgVoidId(ucc, addSel, ruleList);
+            strongSelf.minterBaseHost = baseURL.host.lowercaseString;
+            strongSelf.minterInitialLoadPending = YES;
+            ((void (*)(id, SEL, id, id))objc_msgSend)(
+                strongSelf.webView,
+                NSSelectorFromString(@"loadHTMLString:baseURL:"),
+                html, baseURL);
+        });
+    } copy];
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+        store, compileSel, @"joetv-minter-block-all",
+        JoeMinterBlockAllRules, compiled);
+}
+
 - (void)evaluateJavaScript:(NSString *)js
                 completion:(void (^)(NSString * _Nullable))completion {
     if (self.webView == nil) {
@@ -502,6 +582,23 @@ static BOOL (^JoeRemotePressConsumer)(NSInteger pressType) = nil;
     if (targetFrame != nil) {
         isMainFrame = ((BOOL (*)(id, SEL))objc_msgSend)(
             targetFrame, NSSelectorFromString(@"isMainFrame"));
+    }
+    if (self.navigationMode == JoeWebNavigationModeMinterLockdown) {
+        // Deny-all, silently. The single exception is the
+        // local page load itself (main frame, its base host),
+        // consumed on first sight so nothing can reuse it.
+        id minterRequest = JoeMsgId0(navigationAction,
+                                     NSSelectorFromString(@"request"));
+        NSURL *minterURL = JoeMsgId0(minterRequest,
+                                     NSSelectorFromString(@"URL"));
+        NSString *minterHost = minterURL.host.lowercaseString ?: @"";
+        if (self.minterInitialLoadPending && targetFrame != nil && isMainFrame
+            && self.minterBaseHost != nil
+            && [minterHost isEqualToString:self.minterBaseHost]) {
+            self.minterInitialLoadPending = NO;
+            return YES;
+        }
+        return NO;
     }
     if (!isMainFrame) { return YES; }
     id request = JoeMsgId0(navigationAction,
