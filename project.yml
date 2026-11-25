@@ -124,6 +124,11 @@ targets:
       - JoeTV/JoeYtHlsServer.swift
       - JoeTV/JoeYtNativePlayer.swift
       - JoeTV/JoeYtPlayRouter.swift
+      # claude/po-minter-core: the TV PO-token minter (reserve,
+      # not wired) and its local BotGuard page.
+      - JoeTV/JoeYtPoMinter.swift
+      - path: JoeTV/po_token.html
+        buildPhase: resources
       - path: JoeTV/yt.solver.lib.min.js
         buildPhase: resources
       - path: JoeTV/yt.solver.core.min.js

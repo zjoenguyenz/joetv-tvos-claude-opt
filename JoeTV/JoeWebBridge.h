@@ -53,9 +53,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// - DoorRoam: the sign-in door may roam the YouTube/Google
 ///   domains the official sign-in flow needs (design §3.2);
 ///   anything else is cancelled silently.
+/// - MinterLockdown: the PO-token minter's offscreen page
+///   (JoeYtPoMinter). EVERY navigation is cancelled — main
+///   frame and subframes, any scheme — except the single
+///   initial load started by -loadHTMLString:baseURLString:
+///   userAgent:, and every subresource load is blocked by a
+///   content rule list installed before that load. The page
+///   therefore performs no network I/O at all; all HTTP is
+///   native. Cancellations are silent (never an exit request).
 typedef NS_ENUM(NSInteger, JoeWebNavigationMode) {
     JoeWebNavigationModePlayerLockdown = 0,
     JoeWebNavigationModeDoorRoam = 1,
+    JoeWebNavigationModeMinterLockdown = 2,
 };
 
 /// A UIView hosting one runtime-created WKWebView.
@@ -79,6 +88,21 @@ typedef NS_ENUM(NSInteger, JoeWebNavigationMode) {
 @property (nonatomic) BOOL playbackPressesEnabled;
 
 - (void)loadURLString:(NSString *)urlString userAgent:(nullable NSString *)userAgent;
+/// MinterLockdown only: loads a LOCAL page (an HTML string,
+/// no network) under `baseURLString` as its origin, with
+/// `userAgent` as navigator.userAgent. Before the load it
+/// compiles and installs a block-everything content rule
+/// list on this host's web view; if content blocking is
+/// unavailable the load is refused (fail closed) and
+/// -joeHost:didFailLoadWithMessage: reports
+/// "minter-blocker-unavailable". In any other navigation
+/// mode the call is refused with "minter-mode-required".
+/// Completion arrives through the usual delegate callbacks.
+/// The host may live OFFSCREEN (never added to a window):
+/// nothing in this path needs a window.
+- (void)loadHTMLString:(NSString *)html
+         baseURLString:(NSString *)baseURLString
+             userAgent:(nullable NSString *)userAgent;
 - (void)evaluateJavaScript:(NSString *)js
                 completion:(nullable void (^)(NSString * _Nullable result))completion;
 /// Starts (or restarts) the poll: every `interval` seconds the

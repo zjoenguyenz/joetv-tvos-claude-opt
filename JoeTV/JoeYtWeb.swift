@@ -999,6 +999,47 @@ struct JoeWebView: UIViewRepresentable {
     }
 }
 
+// MARK: - Offscreen host (PO-token minter)
+//
+// claude/po-minter-core: the third bridge surface. A
+// JoeWebHostView created OFFSCREEN — never added to a window
+// or a SwiftUI hierarchy — in the MinterLockdown navigation
+// mode, kept alive by its owner (JoeYtPoMinter) for as long
+// as the minter needs the page. The two existing surfaces
+// (JoeWebView for the player and the door) are untouched:
+// this type only reuses JoeWebController's delegate plumbing.
+@MainActor
+final class JoeWebOffscreenHost {
+    let controller = JoeWebController()
+    private(set) var host: JoeWebHostView?
+
+    init() {
+        // A real, non-zero frame: WebKit lays the page out
+        // against it even though no window ever shows it.
+        let host = JoeWebHostView(frame: CGRect(x: 0, y: 0, width: 1280, height: 720))
+        host.navigationMode = .minterLockdown
+        host.playbackPressesEnabled = false
+        host.delegate = controller
+        controller.host = host
+        self.host = host
+    }
+
+    /// Loads a local page (no network) as `baseURL`, with
+    /// `userAgent` as navigator.userAgent. Outcome arrives on
+    /// the controller's onFinishLoad / onFailLoad callbacks.
+    func loadLocalPage(html: String, baseURL: String, userAgent: String) {
+        host?.loadHTMLString(html, baseURLString: baseURL, userAgent: userAgent)
+    }
+
+    /// Drops the web view. Idempotent.
+    func teardown() {
+        host?.stopPolling()
+        host?.delegate = nil
+        controller.host = nil
+        host = nil
+    }
+}
+
 // MARK: - Player
 
 /// One poll read, decoded from JoeYtJS.poll's JSON.
