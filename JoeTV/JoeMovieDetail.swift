@@ -1859,8 +1859,15 @@ struct JoeMovieDetail: View {
                 // plate, exactly as the F2 name labels do.
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(focusedFav ? theme.surface2 : Color.clear))
+                // claude/opt-2 (FL-422 sweep; RECALC-SPEC R6):
+                // the focused Panel plate is gone — focus is
+                // the chip-family ivory outset outline (2/4),
+                // exactly as the PC cast-name labels already
+                // carry it, driven by this button's binding.
+                .overlay(JoeOutsetRing(
+                    shape: RoundedRectangle(cornerRadius: 8),
+                    color: JoeCinemaFocus.ivory,
+                    lineWidth: 2, offset: 4, forced: focusedFav))
         }
         .joeCardButton()
         .focused($focusedFav)
@@ -1889,9 +1896,12 @@ struct JoeMovieDetail: View {
                     // Panel plate, as pcFavTextButton.
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
-                    .background(RoundedRectangle(cornerRadius: 8)
-                        .fill(focusedFollow ? theme.surface2
-                                            : Color.clear))
+                    // claude/opt-2 (FL-422 sweep; R6): ring,
+                    // no plate — as pcFavTextButton.
+                    .overlay(JoeOutsetRing(
+                        shape: RoundedRectangle(cornerRadius: 8),
+                        color: JoeCinemaFocus.ivory,
+                        lineWidth: 2, offset: 4, forced: focusedFollow))
             }
             .joeCardButton()
             .focused($focusedFollow)
@@ -3817,12 +3827,12 @@ private struct JoeCastCellLabel: View {
         let chipStroke: Color = focused && theme.id != .privateCinema
             ? (theme.id == .posterWall && preselected
                ? Color.white : theme.focus)
-            : (preselected ? Color.clear : theme.stroke)
+            : (preselected && !focused ? Color.clear : theme.stroke)
         let chipLineWidth: CGFloat = focused && theme.id != .privateCinema
             ? theme.ringWidth : 1.5
         let chipForeground: Color = !playable
             ? theme.text.opacity(0.35)
-            : (preselected ? theme.onAccent : theme.text)
+            : (preselected && !focused ? theme.onAccent : theme.text)
         return Button {
             play(d, epName: ep.name)
         } label: {
@@ -3840,8 +3850,10 @@ private struct JoeCastCellLabel: View {
                 .lineLimit(1)
                 .padding(.horizontal, 22)
                 .padding(.vertical, 11)
+                // claude/opt-2 (FL-422): the preselected fill
+                // only while NOT focused; focus is ring-only.
                 .background(Capsule()
-                    .fill(preselected ? theme.accent : theme.surface2))
+                    .fill(preselected && !focused ? theme.accent : theme.surface2))
                 // v2.0.9 (owner defect, theme D only): the same
                 // colour collision as JoeChipLabel — in D the
                 // preselected episode's fill (accent #FFD60A)
@@ -3934,7 +3946,7 @@ private struct JoeCastCellLabel: View {
         let chipStroke: Color = focused && theme.id != .privateCinema
             ? (theme.id == .posterWall && preselected
                ? Color.white : theme.focus)
-            : (preselected ? Color.clear : theme.stroke)
+            : (preselected && !focused ? Color.clear : theme.stroke)
         let chipLineWidth: CGFloat = focused && theme.id != .privateCinema
             ? theme.ringWidth : 1.5
         return Button {
@@ -3944,12 +3956,14 @@ private struct JoeCastCellLabel: View {
                 .font(theme.id == .privateCinema
                       ? JoePCType.outfit(24, weight: preselected ? .semibold : .medium)
                       : .system(size: 24, weight: preselected ? .semibold : .medium))
-                .foregroundStyle(preselected ? theme.onAccent : theme.text)
+                .foregroundStyle(preselected && !focused ? theme.onAccent : theme.text)
                 .lineLimit(1)
                 .padding(.horizontal, 22)
                 .padding(.vertical, 11)
+                // claude/opt-2 (FL-422): the preselected fill
+                // only while NOT focused; focus is ring-only.
                 .background(Capsule()
-                    .fill(preselected ? theme.accent : theme.surface2))
+                    .fill(preselected && !focused ? theme.accent : theme.surface2))
                 .overlay(Capsule()
                     .strokeBorder(chipStroke, lineWidth: chipLineWidth))
                 // Fault 11 fix round: the Private Cinema

@@ -62,6 +62,70 @@ struct JoeYtClientSpec: Sendable {
         deviceModel: "UKS9800",
         osName: "Tizen",
         osVersion: "2.4.0")
+
+    /// YT-403 fix (2026-11-23): the iOS app client
+    /// (yt-dlp master, INNERTUBE_CLIENTS['ios'] — the
+    /// spec leader-verified live: /player OK + formats
+    /// returned). googlevideo began refusing EVERY
+    /// segment the tv_samsung client produces (403 on
+    /// adaptive and muxed alike, DiagLog 2026-11-23
+    /// 21:41) while the iOS client's media still
+    /// fetches — so resolve tries this client FIRST
+    /// and keeps tvSamsung as the fallback. Its API
+    /// key is the iOS client's PUBLIC InnerTube key,
+    /// shipped in every YouTube iOS app; not an
+    /// account credential.
+    static let ios = JoeYtClientSpec(
+        clientName: "IOS",
+        clientVersion: "21.26.4",
+        clientNumber: "5",
+        userAgent: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        apiKey: "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
+        deviceMake: "Apple",
+        deviceModel: "iPhone16,2",
+        osName: "iPhone",
+        osVersion: "18.3.2.22D82")
+
+    /// YT-403 fix, round 2 (2026-11-23): the visionOS
+    /// client (yt-dlp master, INNERTUBE_CLIENTS
+    /// ['visionos']). On device the IOS client + the
+    /// owner's bearer token is refused at /player with
+    /// HTTP 400 (DiagLog 22:41 — every iOS call), while
+    /// the same token serves TVHTML5 fine; the bench
+    /// (docs/yt403, anonymous, public video) measured
+    /// this client's segments at 206 on every range
+    /// with no PO token. It carries no muxed itag 18 —
+    /// the assembly pair is its only construction.
+    /// Its API key is YouTube's PUBLIC web key (the
+    /// fallback key for clients without their own).
+    static let visionos = JoeYtClientSpec(
+        clientName: "VISIONOS",
+        clientVersion: "1.02",
+        clientNumber: "101",
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        deviceMake: "Apple",
+        deviceModel: "RealityDevice17,1",
+        osName: "visionOS",
+        osVersion: "26.5.23O471")
+
+    /// YT-403 round 3 (2026-11-23): yt-dlp's other
+    /// TV-family client — clientName TVHTML5 with the
+    /// Cobalt UA and version 7.20260707.07.00
+    /// (INNERTUBE_CLIENTS['tv'], SUPPORTS_COOKIES).
+    /// Device fields are empty: yt-dlp sends none for
+    /// this client and the context builder omits
+    /// empty fields. Same public TV key as tvSamsung.
+    static let tv = JoeYtClientSpec(
+        clientName: "TVHTML5",
+        clientVersion: "7.20260707.07.00",
+        clientNumber: "7",
+        userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+        apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        deviceMake: "",
+        deviceModel: "",
+        osName: "",
+        osVersion: "")
 }
 
 // MARK: Format model (Sendable by construction)
@@ -106,6 +170,13 @@ struct JoeYtPlayable: Sendable {
         case hlsManifest
     }
     var kind: Kind
+    /// The User-Agent of the client whose /player call
+    /// produced these URLs. The HLS relay must fetch
+    /// segments AS THAT CLIENT (googlevideo binds the
+    /// URLs to it); stamped by the resolver on every
+    /// playable it returns. Defaults to the TV client
+    /// for any playable built outside the resolver.
+    var clientUserAgent: String = JoeYtClientSpec.tvSamsung.userAgent
     /// Assembly inputs (kind == .assembly).
     var videoURL: URL?
     var audioURL: URL?
@@ -192,8 +263,6 @@ enum JoeYtResolveResult: Sendable {
 actor JoeYtResolver {
     static let shared = JoeYtResolver()
 
-    private let spec = JoeYtClientSpec.tvSamsung
-
     /// Session cache of the fetched player JS (the file
     /// is ~2.5 MB and its hash rotates rarely; the FETCH
     /// is cached, the solve still runs per resolve —
@@ -215,19 +284,49 @@ actor JoeYtResolver {
     // MARK: Entry point
 
     func resolve(videoId: String) async -> JoeYtResolveResult {
+        // YT-403 (2026-11-23), round 3: the chain is
+        // TV-family only — iOS/visionOS are convicted
+        // with this token (HTTP 400, both device logs)
+        // and yt-dlp's model agrees (anonymous-only
+        // clients). tvSamsung goes first, now sending
+        // yt-dlp's request shape (playbackContext with
+        // the CURRENT player's signatureTimestamp,
+        // Origin header — see callPlayer); the `tv`
+        // Cobalt client is the second attempt. The
+        // first playable wins; its UA rides the
+        // playable into the relay.
+        let chain: [JoeYtClientSpec] = [.tvSamsung, .tv]
+        var last: JoeYtResolveResult = .needsIdentity
+        for (index, spec) in chain.enumerated() {
+            last = await resolveAttempt(videoId: videoId, spec: spec)
+            if case .playable = last { return last }
+            if index < chain.count - 1 {
+                log("resolve vid=\(videoId): client \(spec.clientName) không cho playable — thử client \(chain[index + 1].clientName)")
+            }
+        }
+        return last
+    }
+
+    private func resolveAttempt(videoId: String,
+                                spec: JoeYtClientSpec) async -> JoeYtResolveResult {
         let identity = await JoeYtIdentity.shared
         guard let initial = await identity.validAccessToken() else {
             log("resolve vid=\(videoId): không có access token dùng được → needsIdentity")
             return .needsIdentity
         }
         var token = initial
-        var call = await callPlayer(token: token, videoId: videoId)
+        // YT-403 round 3: fetch the player JS FIRST
+        // (session-cached; the solver below reuses it)
+        // so /player can declare its signatureTimestamp
+        // the way yt-dlp does.
+        let sts = await currentSignatureTimestamp(videoId: videoId)
+        var call = await callPlayer(token: token, videoId: videoId, spec: spec, sts: sts)
         if call.http == 401 {
             log("resolve vid=\(videoId): /player HTTP 401 — thử refresh 1 lần")
             var retried = false
             if let refreshed = await identity.refreshAccessToken() {
                 token = refreshed
-                call = await callPlayer(token: token, videoId: videoId)
+                call = await callPlayer(token: token, videoId: videoId, spec: spec, sts: sts)
                 retried = true
             }
             if retried, call.http == 401 {
@@ -252,7 +351,8 @@ actor JoeYtResolver {
                 log("resolve vid=\(videoId): /player lỗi mạng (không có HTTP response)")
                 return .transportFailure(message: "Không gọi được YouTube (mạng).")
             }
-            log("resolve vid=\(videoId): /player HTTP \(call.http)")
+            let apiError = (call.json?["error"] as? [String: Any])?["message"] as? String ?? ""
+            log("resolve vid=\(videoId): /player HTTP \(call.http) client=\(spec.clientName)\(apiError.isEmpty ? "" : " — \(apiError)")")
             return .httpFailure(status: call.http)
         }
 
@@ -290,7 +390,7 @@ actor JoeYtResolver {
         // 135+140 with no way to tell which.
         let censusList = all.map { $0.itag }.sorted()
             .map { String($0) }.joined(separator: ",")
-        log("resolve vid=\(videoId): /player \(call.ms)ms playability=OK formats=\(all.count) ciphered=\(cipheredCount)")
+        log("resolve vid=\(videoId): /player \(call.ms)ms client=\(spec.clientName) playability=OK formats=\(all.count) ciphered=\(cipheredCount) sts=\(sts.map(String.init) ?? "-")")
 
         // FL-350 (2.0.45, leg 2): the caption inventory —
         // parsed HERE, at the same parse point, and
@@ -309,6 +409,7 @@ actor JoeYtResolver {
             // fired — it is per-resolve evidence.
             log("resolve vid=\(videoId): response có HLS manifest — dùng thẳng, census=[\(censusList)]")
             var playable = JoeYtPlayable(kind: .hlsManifest)
+            playable.clientUserAgent = spec.userAgent
             playable.directURL = hlsURL
             return .playable(playable, metrics)
         }
@@ -473,6 +574,7 @@ actor JoeYtResolver {
            let videoURL = solvedURLs[video.itag],
            let audioURL = solvedURLs[audio.itag] {
             var playable = JoeYtPlayable(kind: .assembly)
+            playable.clientUserAgent = spec.userAgent
             playable.videoURL = videoURL
             playable.audioURL = audioURL
             playable.videoInitRange = videoInit
@@ -500,6 +602,7 @@ actor JoeYtResolver {
         }
         if let muxedFallback, let url = solvedURLs[muxedFallback.itag] {
             var playable = JoeYtPlayable(kind: .muxed)
+            playable.clientUserAgent = spec.userAgent
             playable.directURL = url
             playable.videoItag = muxedFallback.itag
             playable.width = muxedFallback.width
@@ -606,24 +709,39 @@ actor JoeYtResolver {
     // MARK: /player call (Probe 16's shape, verbatim)
 
     private func callPlayer(token: String,
-                            videoId: String) async -> (http: Int, json: [String: Any]?, ms: Int) {
+                            videoId: String,
+                            spec: JoeYtClientSpec,
+                            sts: Int?) async -> (http: Int, json: [String: Any]?, ms: Int) {
         guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false&key=\(spec.apiKey)") else {
             return (0, nil, 0)
         }
-        let clientContext: [String: Any] = [
+        var clientContext: [String: Any] = [
             "clientName": spec.clientName,
             "clientVersion": spec.clientVersion,
             "hl": "en",
             "gl": "US",
             "userAgent": spec.userAgent,
-            "deviceMake": spec.deviceMake,
-            "deviceModel": spec.deviceModel,
-            "osName": spec.osName,
-            "osVersion": spec.osVersion,
         ]
+        // Empty spec fields are OMITTED, not sent empty
+        // (yt-dlp's `tv` context carries no device/os
+        // fields at all).
+        if !spec.deviceMake.isEmpty { clientContext["deviceMake"] = spec.deviceMake }
+        if !spec.deviceModel.isEmpty { clientContext["deviceModel"] = spec.deviceModel }
+        if !spec.osName.isEmpty { clientContext["osName"] = spec.osName }
+        if !spec.osVersion.isEmpty { clientContext["osVersion"] = spec.osVersion }
+        // YT-403 round 3: playbackContext, yt-dlp's
+        // shape — html5Preference always, and the
+        // current player's signatureTimestamp when it
+        // could be extracted. The pre-round-3 request
+        // sent NO playbackContext at all; the segment
+        // gate opened exactly when the player changed
+        // (sts 20774 → 20775).
+        var contentPlayback: [String: Any] = ["html5Preference": "HTML5_PREF_WANTS"]
+        if let sts { contentPlayback["signatureTimestamp"] = sts }
         let body: [String: Any] = [
             "videoId": videoId,
             "context": ["client": clientContext],
+            "playbackContext": ["contentPlaybackContext": contentPlayback],
             "contentCheckOk": true,
             "racyCheckOk": true,
         ]
@@ -632,6 +750,7 @@ actor JoeYtResolver {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(spec.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(spec.clientNumber, forHTTPHeaderField: "X-YouTube-Client-Name")
         request.setValue(spec.clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
@@ -901,6 +1020,26 @@ actor JoeYtResolver {
         log("player-js: trang embed trỏ jsUrl → path \(URL(string: full)?.path ?? src)")
         return await fetchPlayerFile(urlString: full, source: "embed",
                                      userAgent: Self.embedUA)
+    }
+
+    /// YT-403 round 3: the signatureTimestamp of the
+    /// CURRENT player JS, extracted from the same
+    /// file the solver uses (measured: player
+    /// 7f755914 → 20775, its predecessor → 20774).
+    /// yt-dlp declares this value in /player's
+    /// playbackContext; before round 3 the app
+    /// never sent it.
+    private func currentSignatureTimestamp(videoId: String) async -> Int? {
+        guard let playerJS = await acquirePlayerJS(videoId: videoId) else { return nil }
+        guard let raw = regexCapture(in: playerJS.text,
+                                     pattern: #"signatureTimestamp\D{0,3}(\d+)"#,
+                                     group: 1),
+              let sts = Int(raw) else {
+            log("sts: không tìm thấy signatureTimestamp trong player JS (nguồn \(playerJS.source))")
+            return nil
+        }
+        log("sts: player nguồn \(playerJS.source) signatureTimestamp=\(sts)")
+        return sts
     }
 
     private func acquirePlayerJS(videoId: String) async -> PlayerJS? {

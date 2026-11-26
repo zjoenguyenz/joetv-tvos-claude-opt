@@ -247,6 +247,20 @@ final class JoeYtHlsServer {
         for rendition in renditions {
             log("session \(id.prefix(8)): phụ đề vào master — \(rendition.language) (\(rendition.vtt.count) byte vtt)")
         }
+        // FL-484/485 instrumentation (2.1.6, LOG-ONLY): a
+        // loopback self-probe at session-presentation
+        // time — one TCP connect attempt to the relay's
+        // own port, its result logged beside the serve
+        // logs above. ensureStarted's only health check is
+        // listener.state == .ready: in the 2026-11-24
+        // incident the listener reported ready while its
+        // accepts wedged, and nothing in the log could see
+        // it — the probe exists to capture that signature
+        // next time. It changes NO behaviour: the listener
+        // is never restarted or re-bound here.
+        if let boundPort {
+            probeLoopback(port: boundPort, sessionID: id)
+        }
         guard let boundPort else { return nil }
         guard let url = URL(string: "http://127.0.0.1:\(boundPort)/yt/\(id)/master.m3u8")
         else { return nil }
@@ -260,6 +274,39 @@ final class JoeYtHlsServer {
     /// body bytes move). Unknown session = false.
     func firstMediaServed(sessionID: String) -> Bool {
         sessions[sessionID]?.firstSegmentServed ?? false
+    }
+
+    /// FL-484/485 instrumentation (2.1.6, LOG-ONLY): one
+    /// TCP connect to the relay's own 127.0.0.1 port. The
+    /// result is logged and the probe connection is
+    /// cancelled in every terminal state — the probe
+    /// never serves, never retries, and never touches
+    /// the listener. On loopback a .waiting refusal is
+    /// the wedge's signature: the port IS bound (this
+    /// process bound it) yet the connect does not
+    /// complete.
+    private func probeLoopback(port: UInt16, sessionID: String) {
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else { return }
+        let connection = NWConnection(host: "127.0.0.1",
+                                      port: endpointPort,
+                                      using: .tcp)
+        let label = String(sessionID.prefix(8))
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                DiagLog.write("YT-HLS", "loopback self-probe session \(label): OK — 127.0.0.1:\(port) nhận kết nối")
+                connection.cancel()
+            case .waiting(let error):
+                DiagLog.write("YT-HLS", "loopback self-probe session \(label): WAITING — \(error.localizedDescription)")
+                connection.cancel()
+            case .failed(let error):
+                DiagLog.write("YT-HLS", "loopback self-probe session \(label): FAIL — \(error.localizedDescription)")
+                connection.cancel()
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global(qos: .utility))
     }
 
     // MARK: Subtitle renditions (FL-350, leg 2)

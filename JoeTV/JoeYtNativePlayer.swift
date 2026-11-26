@@ -176,6 +176,35 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// current; the waiting leg's threshold keys on it
     /// (45 s while starting up, 20 s mid-episode).
     private var currentItemFramed = false
+    /// FL-485 (2.1.6): the CURRENT item has ENDED
+    /// (AVPlayerItemDidPlayToEndTime fired for it). The
+    /// stall watchdog reads this: an ended item parked at
+    /// pos == duration is ENDED, never a mid-episode
+    /// freeze, and must never draw recoverOrFail /
+    /// terminalFailure. Set at the top of
+    /// handleItemEnded; cleared wherever a new item
+    /// becomes current (start, the supervisor's
+    /// transition block, the recovery completion, the
+    /// muxed swap, the FL-484 loopback re-presentation)
+    /// and in retry().
+    private var currentItemEnded = false
+    /// FL-484 (2.1.6): the loopback-connect retry budget
+    /// for the CURRENT item — a bounded count of
+    /// same-playable re-presentations spent on a local
+    /// connect refusal WITHOUT consuming recoverySpent.
+    /// Reset at the same points as currentItemEnded.
+    private var loopbackRetries = 0
+    /// FL-485 (2.1.6): the status observation on the
+    /// QUEUED successor item. Until now a queued item
+    /// carried no status observer at all — a successor
+    /// that failed (or never loaded) while queued was
+    /// invisible until the current item ended and the
+    /// queue silently failed to advance (the convicted
+    /// specimen: a queued ep=4 item with zero requests to
+    /// its session in 23 minutes). Installed at both
+    /// insert sites; invalidated wherever the queue
+    /// bookkeeping is cleared.
+    private var queuedStatusObservation: NSKeyValueObservation?
     /// 2.0.44 watchdog: the waiting leg's progress
     /// baselines. While the playhead or the loaded
     /// buffer end keeps moving, the waiting deadline
@@ -357,6 +386,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
             JoeYtQualityMap.record(pid: self.request.pid,
                                    height: built.height)
             self.currentItemFramed = false
+            self.currentItemEnded = false
+            self.loopbackRetries = 0
             self.player.replaceCurrentItem(with: item)
             self.observeCurrentItem(item)
             self.playStartedAt = Date()
@@ -393,6 +424,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
         statusTask?.cancel()
         supervisorTask?.cancel()
         itemStatusObservation?.invalidate()
+        // FL-485 (2.1.6): the queued successor's
+        // observation dies with the player's own.
+        queuedStatusObservation?.invalidate()
+        queuedStatusObservation = nil
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
         }
@@ -434,7 +469,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             return (AVPlayerItem(url: url), nil, playable.height)
         case .assembly:
             if let session = await JoeYtHlsServer.shared.makeSession(
-                playable: playable, userAgent: JoeYtClientSpec.tvSamsung.userAgent) {
+                playable: playable, userAgent: playable.clientUserAgent) {
                 return (AVPlayerItem(url: session.url), session.sessionID,
                         playable.height)
             }
@@ -483,8 +518,19 @@ final class JoeYtNativePlayerModel: ObservableObject {
             [weak self] observed, _ in
             let status = observed.status
             let errorText = observed.error?.localizedDescription
+            // FL-484 (2.1.6): the error's domain + code ride
+            // along (Sendable values, the same FL-343
+            // pattern) so the failure classifier can tell a
+            // loopback connect refusal from an origin
+            // failure — the text alone cannot convict the
+            // class.
+            let nsError = observed.error as NSError?
+            let errorDomain = nsError?.domain
+            let errorCode = nsError?.code
             Task { @MainActor in
-                self?.handleItemStatus(status, errorText: errorText)
+                self?.handleItemStatus(status, errorText: errorText,
+                                       errorDomain: errorDomain,
+                                       errorCode: errorCode)
             }
         }
         endObserver = NotificationCenter.default.addObserver(
@@ -510,7 +556,9 @@ final class JoeYtNativePlayerModel: ObservableObject {
     }
 
     private func handleItemStatus(_ status: AVPlayerItem.Status,
-                                  errorText: String?) {
+                                  errorText: String?,
+                                  errorDomain: String? = nil,
+                                  errorCode: Int? = nil) {
         guard !terminal else { return }
         switch status {
         case .readyToPlay:
@@ -527,9 +575,204 @@ final class JoeYtNativePlayerModel: ObservableObject {
             let message = errorText
                 ?? "item failed (không có error text)"
             log("item FAILED ep=\(currentIndex + 1) — \(message)")
-            recoverOrFail(reason: message)
+            // FL-484 (2.1.6): classify BEFORE the cascade.
+            // A loopback connect refusal against the app's
+            // OWN 127.0.0.1 assembly relay is a LOCAL
+            // failure class of its own: the 2026-11-24
+            // trace showed it firing ~40–100 ms after
+            // placement, while the wedged listener
+            // momentarily refused connects, and the
+            // unclassified cascade burned the ONE-SHOT
+            // recovery on it exactly like a dead origin —
+            // the cascade's next step then diverted to
+            // the muxed swap and the episode silently
+            // dropped to the muxed tier. On this class the
+            // SAME assembly playable is re-presented
+            // (bounded) and the recovery budget is NOT
+            // consumed. Every other failure flows into
+            // recoverOrFail exactly as before. This
+            // handler is the single funnel for fresh open,
+            // resume and autoplay-next alike — every
+            // item-open surface shares this classification.
+            if isLoopbackConnectFailure(errorDomain: errorDomain,
+                                        errorCode: errorCode,
+                                        errorText: errorText) {
+                retryLoopbackItem(reason: message)
+            } else {
+                recoverOrFail(reason: message)
+            }
         default:
             break
+        }
+    }
+
+    /// FL-484 (2.1.6): the loopback connect-refusal
+    /// class — the CURRENT item is an assembly item (its
+    /// URL is the app's own 127.0.0.1 relay) AND the
+    /// failure is a connect refusal: NSURLErrorDomain
+    /// -1004 (NSURLErrorCannotConnectToHost), or the
+    /// exact refusal text the incident log carried
+    /// ("Could not connect to the server." — the
+    /// localized text of that same code on this OS).
+    private func isLoopbackConnectFailure(errorDomain: String?,
+                                          errorCode: Int?,
+                                          errorText: String?) -> Bool {
+        guard currentPlayable?.kind == .assembly else { return false }
+        if errorDomain == NSURLErrorDomain,
+           errorCode == NSURLErrorCannotConnectToHost {
+            return true
+        }
+        return errorText == "Could not connect to the server."
+    }
+
+    /// FL-484 (2.1.6): re-present the SAME assembly
+    /// playable after a loopback connect refusal — a
+    /// fresh item (and a fresh assembly session) on the
+    /// same relay, replaced in, re-observed, sought back
+    /// to the vouched checkpoint, played. Bounded at 2
+    /// re-presentations per item; recoverySpent is NOT
+    /// touched — a local refusal is not an origin
+    /// failure, and spending the one-shot re-resolve on
+    /// it is the convicted defect. On exhaustion (or a
+    /// failed rebuild) the normal cascade resumes with
+    /// the refusal as its reason. The completion mirrors
+    /// recoverOrFail's discipline: attempt token, the
+    /// in-flight gate, the episode-index revalidation,
+    /// the prefetched-queue reconciliation, and the
+    /// armed-advance consumption.
+    private func retryLoopbackItem(reason: String) {
+        guard !terminal, !opInFlight else { return }
+        guard loopbackRetries < 2, let playable = currentPlayable else {
+            log("FL-484: loopback retry đã hết (hoặc không còn playable) — về cascade thường")
+            recoverOrFail(reason: reason)
+            return
+        }
+        loopbackRetries += 1
+        let myTry = loopbackRetries
+        attempt += 1
+        let myAttempt = attempt
+        opInFlight = true
+        let episodeIndex = currentIndex
+        let seekTo = checkpointSeconds
+        log("FL-484: loopback connect bị từ chối — dựng lại item assembly ep=\(currentIndex + 1) (thử \(myTry)/2, KHÔNG tốn recovery) — \(reason)")
+        Task { [weak self] in
+            guard let self else { return }
+            // A short beat for the wedged listener to
+            // clear before the new session's first fetch.
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            let built = await self.buildItem(for: playable)
+            guard !self.terminal, self.attempt == myAttempt else {
+                self.opInFlight = false
+                return
+            }
+            guard let built else {
+                self.opInFlight = false
+                self.log("FL-484: dựng lại item thất bại — về cascade thường")
+                self.recoverOrFail(reason: reason)
+                return
+            }
+            guard self.currentIndex == episodeIndex else {
+                self.opInFlight = false
+                self.log("FL-484: tập hiện tại đã đổi trong lúc dựng lại — bỏ replace")
+                return
+            }
+            self.currentItemHeight = built.height
+            self.currentItemFramed = false
+            self.currentItemEnded = false
+            self.player.replaceCurrentItem(with: built.item)
+            self.observeCurrentItem(built.item)
+            // The same queue reconciliation as the
+            // recovery replace: a dropped prefetched item
+            // must not leave stale bookkeeping behind.
+            if let queued = self.queuedItem,
+               !self.player.items().contains(where: { $0 === queued }) {
+                self.clearQueuedBookkeeping()
+                self.log("FL-484: item prefetch không còn trong hàng đợi sau replace — dọn sổ, prefetch lại")
+                self.startPrefetch()
+            }
+            if seekTo > 2 {
+                await self.player.seek(
+                    to: CMTime(seconds: seekTo, preferredTimescale: 600))
+            }
+            self.waitingSince = nil
+            self.advanceUnconfirmedSince = nil
+            self.pausedStallSince = nil
+            self.playStartedAt = Date()
+            self.player.play()
+            self.opInFlight = false
+            self.log("FL-484: item assembly đã dựng lại — phát ep=\(self.currentIndex + 1) từ \(Int(seekTo))s")
+            if self.advancePending, !self.prefetchInFlight {
+                self.advancePending = false
+                self.runAdvanceChain()
+            }
+        }
+    }
+
+    /// FL-485 (2.1.6): clear every piece of queued-
+    /// successor bookkeeping in one place — the item, its
+    /// index / playable / session / height, and its
+    /// status observation — so no field (or observer) is
+    /// left stale behind when a path drops the queue.
+    /// The pre-existing clear points keep their inline
+    /// field writes and additionally invalidate the
+    /// observation (see the transition block, the two
+    /// replace reconciliations, and stop()).
+    private func clearQueuedBookkeeping() {
+        queuedStatusObservation?.invalidate()
+        queuedStatusObservation = nil
+        queuedItem = nil
+        queuedIndex = nil
+        queuedPlayable = nil
+        queuedSessionID = nil
+        queuedItemHeight = 0
+    }
+
+    /// FL-485 (2.1.6): observe the QUEUED successor's
+    /// status from the moment it is inserted. A queued
+    /// item that fails while waiting is logged the moment
+    /// it happens — previously invisible, because no
+    /// observer existed. The DECISION is still taken at
+    /// item end (handleItemEnded) and by the watchdog's
+    /// ended leg, which read the same status. The
+    /// callback hops to the main actor with Sendable
+    /// values only (the FL-343 discipline): the item
+    /// itself is matched by ObjectIdentifier, never
+    /// carried across the hop.
+    private func observeQueuedItem(_ item: AVPlayerItem) {
+        queuedStatusObservation?.invalidate()
+        let watchedID = ObjectIdentifier(item)
+        queuedStatusObservation = item.observe(\.status, options: [.new, .initial]) {
+            [weak self] observed, _ in
+            let status = observed.status
+            let errorText = observed.error?.localizedDescription
+            Task { @MainActor in
+                guard let self,
+                      let queued = self.queuedItem,
+                      ObjectIdentifier(queued) == watchedID,
+                      status == .failed else { return }
+                self.log("FL-485: item xếp hàng ep=\((self.queuedIndex ?? -1) + 1) FAILED trong lúc chờ — \(errorText ?? "không có error text")")
+            }
+        }
+    }
+
+    /// FL-485 (2.1.6): the queued successor cannot carry
+    /// the advance (it failed, or it never became ready):
+    /// drop it from the player and the bookkeeping, then
+    /// take the EXPLICIT advance — armed behind an
+    /// in-flight operation exactly like the
+    /// nothing-queued case, or the gated
+    /// resolve → insert → advance chain now (the same
+    /// flow a fresh next-episode open uses).
+    private func dropQueuedAndAdvanceExplicitly() {
+        if let queued = queuedItem {
+            player.remove(queued)
+        }
+        clearQueuedBookkeeping()
+        if prefetchInFlight || opInFlight {
+            advancePending = true
+            log("FL-485: advance tường minh đã arm (đang bận: prefetch/recovery)")
+        } else {
+            runAdvanceChain()
         }
     }
 
@@ -541,6 +784,11 @@ final class JoeYtNativePlayerModel: ObservableObject {
 
     private func handleItemEnded() {
         guard !terminal else { return }
+        // FL-485 (2.1.6): record the end FIRST — the
+        // stall watchdog reads currentItemEnded, and an
+        // item parked at pos == duration from this moment
+        // on is ENDED, never a mid-episode freeze.
+        currentItemEnded = true
         // The outgoing item is still the current item at
         // this instant — capture the owner's manual
         // subtitle/audio picks from it before the queue
@@ -552,33 +800,59 @@ final class JoeYtNativePlayerModel: ObservableObject {
             log("hết tập cuối — end slate")
             return
         }
-        // With the next item already queued, the queue
-        // itself advances; the supervisor's currentItem
-        // watch performs the index bookkeeping (one code
-        // path for both the automatic and the manual
-        // advance — FL-330).
+        // FL-485 (2.1.6): with a successor queued, its
+        // STATE decides — the pre-fix handler did nothing
+        // here and trusted the queue to advance, but the
+        // convicted specimen's queued item had never
+        // loaded at all (zero requests to its session in
+        // 23 minutes, no status observer anywhere), so
+        // the advance silently never came and the stall
+        // watchdog later condemned the ENDED item.
+        //
+        // READY: the queue itself advances; the
+        // supervisor's currentItem watch performs the
+        // index bookkeeping (one code path for both the
+        // automatic and the manual advance — FL-330) —
+        // exactly the pre-fix behaviour.
+        //
+        // FAILED, or never became ready: drop the queued
+        // item and run the explicit advance (the same
+        // resolve+present flow a fresh next-episode open
+        // uses) instead of trusting an advance that
+        // cannot come.
         //
         // With NOTHING queued (review round 2, BLOCKER
-        // 2) the queue cannot advance: the player sits
-        // paused on the ended item, timeControlStatus is
-        // .paused — never .waiting — so the stall leg can
-        // never fire. Drive the same path a press would
-        // take: arm behind the in-flight prefetch, or run
-        // the gated chain now.
-        if queuedItem == nil {
-            if prefetchInFlight || opInFlight {
-                // opInFlight = a recovery chain is
-                // re-placing this episode (review round
-                // 3, MINOR): arm exactly like the prefetch
-                // case — the recovery completion consumes
-                // the arm when its gate frees. (Arming was
-                // previously skipped here, and the advance
-                // was silently lost.)
-                advancePending = true
-                log("hết tập trong lúc đang bận (prefetch/recovery) — advance đã arm")
-            } else {
-                runAdvanceChain()
+        // 2) the queue cannot advance either: the player
+        // sits paused on the ended item, timeControlStatus
+        // is .paused — never .waiting — so the stall leg
+        // can never fire. Drive the same path a press
+        // would take: arm behind the in-flight prefetch,
+        // or run the gated chain now.
+        if let queued = queuedItem {
+            switch queued.status {
+            case .readyToPlay:
+                log("FL-485: hết tập — successor ep=\(currentIndex + 2) READY, queue tự advance (native)")
+            case .failed:
+                log("FL-485: hết tập — successor ep=\(currentIndex + 2) đã FAILED trong hàng đợi — bỏ hàng đợi, chạy advance tường minh")
+                dropQueuedAndAdvanceExplicitly()
+            default:
+                log("FL-485: hết tập — successor ep=\(currentIndex + 2) chưa từng ready (status=\(queued.status.rawValue)) — bỏ hàng đợi, chạy advance tường minh")
+                dropQueuedAndAdvanceExplicitly()
             }
+            return
+        }
+        if prefetchInFlight || opInFlight {
+            // opInFlight = a recovery chain is
+            // re-placing this episode (review round
+            // 3, MINOR): arm exactly like the prefetch
+            // case — the recovery completion consumes
+            // the arm when its gate frees. (Arming was
+            // previously skipped here, and the advance
+            // was silently lost.)
+            advancePending = true
+            log("hết tập trong lúc đang bận (prefetch/recovery) — advance đã arm")
+        } else {
+            runAdvanceChain()
         }
     }
 
@@ -609,6 +883,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // F-2).
             saveProgressSnapshot(durationOverride: currentDurationSeconds)
             currentIndex = index
+            // FL-485 (2.1.6): the promoted item's queued
+            // observation is spent with its bookkeeping.
+            queuedStatusObservation?.invalidate()
+            queuedStatusObservation = nil
             queuedItem = nil
             queuedIndex = nil
             queuedSessionID = nil
@@ -643,6 +921,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
             currentPlayable = queuedPlayable
             queuedPlayable = nil
             currentItemFramed = false
+            currentItemEnded = false
+            loopbackRetries = 0
             firstFrameLogged = false
             waitingSince = nil
             // The advance the stamp waited on HAS landed
@@ -817,8 +1097,34 @@ final class JoeYtNativePlayerModel: ObservableObject {
             let limit: TimeInterval = currentItemFramed ? 20 : 45
             if let since = waitingSince,
                Date().timeIntervalSince(since) > limit, !opInFlight {
-                log("stall — waiting \(Int(limit))s ở ep=\(currentIndex + 1) tại \(Int(checkpointSeconds))s (khung: \(currentItemFramed ? "giữa tập" : "khởi động"), không tiến triển)")
-                recoverOrFail(reason: "stall waiting \(Int(limit))s")
+                // FL-485 (2.1.6): an ENDED item waiting on
+                // its queued successor is not stalled — it
+                // is finished. The pre-fix leg read
+                // pos == duration as a freeze and fired the
+                // recovery cascade at an item that had
+                // already ended; with the recovery budget
+                // already spent (the FL-484 shape) that
+                // fell straight through to the terminal
+                // slate the owner read as "no source
+                // available" at an episode transition.
+                // Ended items belong to the item-end paths:
+                // a healthy successor advances natively,
+                // and a successor that STILL has not become
+                // ready past the limit (it may have been
+                // mid-load at the end event itself) gets
+                // the explicit advance here. recoverOrFail
+                // never fires for an ended item.
+                if currentItemEnded {
+                    if let queued = queuedItem,
+                       queued.status != .readyToPlay {
+                        log("FL-485: watchdog — item ep=\(currentIndex + 1) đã HẾT, successor ep=\(currentIndex + 2) vẫn chưa ready sau \(Int(limit))s chờ — advance tường minh, KHÔNG recover")
+                        dropQueuedAndAdvanceExplicitly()
+                    }
+                    waitingSince = nil
+                } else {
+                    log("stall — waiting \(Int(limit))s ở ep=\(currentIndex + 1) tại \(Int(checkpointSeconds))s (khung: \(currentItemFramed ? "giữa tập" : "khởi động"), không tiến triển)")
+                    recoverOrFail(reason: "stall waiting \(Int(limit))s")
+                }
             }
         } else {
             waitingSince = nil
@@ -970,6 +1276,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
                     JoeYtQualityMap.record(pid: self.request.pid,
                                            height: built.height)
                     self.currentItemFramed = false
+                    self.currentItemEnded = false
+                    self.loopbackRetries = 0
                     self.player.replaceCurrentItem(with: item)
                     self.observeCurrentItem(item)
                     // Reconcile the prefetched queue entry
@@ -985,6 +1293,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
                     // semantics.
                     if let queued = self.queuedItem,
                        !self.player.items().contains(where: { $0 === queued }) {
+                        self.queuedStatusObservation?.invalidate()
+                        self.queuedStatusObservation = nil
                         self.queuedItem = nil
                         self.queuedIndex = nil
                         self.queuedPlayable = nil
@@ -1090,6 +1400,12 @@ final class JoeYtNativePlayerModel: ObservableObject {
               let muxedURL = playable.fallbackDirectURL else { return false }
         muxedSpent = true
         log("lùi muxed 18 — lý do: \(reason)")
+        // FL-484 (2.1.6): the swap is a QUALITY DOWNGRADE
+        // and must never be silent in the log — this
+        // marker names it in one greppable line: the
+        // episode, the tier it fell FROM, the tier it
+        // lands ON. (Log only — no UI change.)
+        log("MUXED-SWAP-DOWNGRADE ep=\(currentIndex + 1): assembly → muxed itag 18 (\(playable.fallbackHeight)p) — lý do: \(reason)")
         // FL-351 (leg 4): the item now playing is the
         // muxed variant — the spoken height follows it.
         currentItemHeight = playable.fallbackHeight
@@ -1105,6 +1421,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
         // item, its bookkeeping must not go stale.
         if let queued = queuedItem,
            !player.items().contains(where: { $0 === queued }) {
+            queuedStatusObservation?.invalidate()
+            queuedStatusObservation = nil
             queuedItem = nil
             queuedIndex = nil
             queuedPlayable = nil
@@ -1118,6 +1436,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
         advanceUnconfirmedSince = nil
         pausedStallSince = nil
         currentItemFramed = false
+        currentItemEnded = false
+        loopbackRetries = 0
         playStartedAt = Date()
         if seekTo > 2 {
             player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600))
@@ -1271,6 +1591,11 @@ final class JoeYtNativePlayerModel: ObservableObject {
         guard !terminal else { return }
         phase = .starting
         recoverySpent = false
+        // FL-485 (2.1.6): the retried item is a fresh
+        // presentation — the ended flag and the loopback
+        // budget reset with the recovery budgets.
+        currentItemEnded = false
+        loopbackRetries = 0
         // FL-347: the owner's retry restores BOTH
         // recovery budgets (same reset points as
         // recoverySpent, spec §4.3.2).
@@ -1356,6 +1681,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // supervisor's transition confirmation —
             // prefetch alone never touches currentPlayable.
             self.queuedPlayable = playable
+            // FL-485 (2.1.6): the queued successor carries
+            // a status observation from this moment (see
+            // observeQueuedItem).
+            self.observeQueuedItem(item)
             self.log("prefetch ep=\(nextIndex + 1) đã vào hàng đợi (solver \(metrics.solverMs)ms)")
             // Consume an armed advance — UNLESS a
             // recovery chain holds the gate (review round
@@ -1534,6 +1863,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
                         // prefetch insert — promoted at
                         // the transition confirmation.
                         self.queuedPlayable = playable
+                        // FL-485 (2.1.6): same queued-item
+                        // status observation as the
+                        // prefetch insert.
+                        self.observeQueuedItem(item)
                         self.opInFlight = false
                         self.consumeAdvance()
                     }
@@ -1725,12 +2058,29 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
     /// overlay is drawn.
     let hasNextEpisode: Bool
     let onNextEpisode: () -> Void
+    /// leader (owner 2026-11-23: Back "lúc được lúc không …
+    /// giành giựt nhau"): the transport bar's visibility,
+    /// reported up so the SwiftUI exit command can apply
+    /// the single-owner rule (see onExitCommand in
+    /// JoeYtNativePlayerView).
+    var onBarVisibility: ((Bool) -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
         controller.showsPlaybackControls = true
-        applyMenuItems(to: controller)
+        // opt-2 (Back fix): delegate only to LOG the
+        // transport bar's announced visibility, so the next
+        // owner log shows whether a Menu press was spent by
+        // AVKit hiding its own bar. The delegate answers
+        // nothing else (no other delegate method is
+        // implemented), so AVKit's behaviour is unchanged.
+        controller.delegate = context.coordinator
+        context.coordinator.onNextEpisode = onNextEpisode
+        context.coordinator.onBarVisibility = onBarVisibility
+        applyMenuItems(to: controller, coordinator: context.coordinator)
         return controller
     }
 
@@ -1739,19 +2089,69 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         if controller.player !== player {
             controller.player = player
         }
-        applyMenuItems(to: controller)
+        context.coordinator.onNextEpisode = onNextEpisode
+        context.coordinator.onBarVisibility = onBarVisibility
+        applyMenuItems(to: controller, coordinator: context.coordinator)
     }
 
-    private func applyMenuItems(to controller: AVPlayerViewController) {
+    /// opt-2 (Back fix, owner 2026-11-22: "mở tvb phim
+    /// chạy thì sẽ không bấm được nút back, bấm 3-4 lần nó
+    /// mới work"): pre-fix this re-ASSIGNED a brand-new
+    /// `[UIAction]` to transportBarCustomMenuItems on EVERY
+    /// SwiftUI update of the player view — each phase flip,
+    /// each status-pill flash/clear, each WatchStore
+    /// progress publish (the view observes WatchStore) —
+    /// i.e. several AVKit transport-bar rebuilds in the
+    /// first seconds of every episode, exactly the window
+    /// in which the owner's Menu presses went unanswered.
+    /// The normal-film AVPlayerViewController host (whose
+    /// update is empty) never does this, and its Back is
+    /// device-proven. Now the items are assigned only when
+    /// the item's PRESENCE changes; the action calls
+    /// through the coordinator, so it always runs the
+    /// latest closure. Same bar, same title, same action.
+    private func applyMenuItems(to controller: AVPlayerViewController,
+                                coordinator: Coordinator) {
+        guard coordinator.appliedHasNext != hasNextEpisode else { return }
+        coordinator.appliedHasNext = hasNextEpisode
         if hasNextEpisode {
             controller.transportBarCustomMenuItems = [
-                UIAction(title: "Tập tiếp theo") { _ in onNextEpisode() }
+                UIAction(title: "Tập tiếp theo") { [weak coordinator] _ in
+                    // UIKit runs action handlers on main;
+                    // assumeIsolated states that for the
+                    // @MainActor coordinator under Swift 6.
+                    MainActor.assumeIsolated {
+                        coordinator?.onNextEpisode?()
+                    }
+                }
             ]
         } else if !controller.transportBarCustomMenuItems.isEmpty {
             controller.transportBarCustomMenuItems = []
         }
     }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        /// nil = nothing assigned yet (first apply always runs).
+        var appliedHasNext: Bool?
+        var onNextEpisode: (() -> Void)?
+        var onBarVisibility: ((Bool) -> Void)?
+
+        func playerViewController(
+            _ playerViewController: AVPlayerViewController,
+            willTransitionToVisibilityOfTransportBar visible: Bool,
+            with _: AVPlayerViewControllerAnimationCoordinator
+        ) {
+            DiagLog.write("YT-PLAY", "transport bar \(visible ? "hiện" : "ẩn")")
+            onBarVisibility?(visible)
+        }
+    }
 }
+
+/// Swift 6: the same SE-0470 main-actor isolated
+/// conformance PlayerController.Coordinator uses (see the
+/// note there) — AVKit calls the delegate on main only.
+extension JoeYtPlayerControllerView.Coordinator: @MainActor AVPlayerViewControllerDelegate {}
 
 // MARK: - Player view
 
@@ -1765,6 +2165,10 @@ struct JoeYtNativePlayerView: View {
     @EnvironmentObject private var watch: WatchStore
     @Environment(\.joeTheme) private var theme
     @StateObject private var model: JoeYtNativePlayerModel
+    /// leader: last transport-bar visibility AVKit
+    /// announced (the bar announces "hiện" as the player
+    /// opens, so the initial value is true).
+    @State private var transportBarVisible = true
     @FocusState private var retryFocused: Bool
     /// FL-353 sweep (2.0.45 gate round 5, C5-3): the end
     /// slate's back button focus.
@@ -1792,7 +2196,8 @@ struct JoeYtNativePlayerView: View {
                 JoeYtPlayerControllerView(
                     player: model.player,
                     hasNextEpisode: model.hasNextEpisode,
-                    onNextEpisode: { model.requestAdvance(trigger: "menu") })
+                    onNextEpisode: { model.requestAdvance(trigger: "menu") },
+                    onBarVisibility: { transportBarVisible = $0 })
                     .ignoresSafeArea()
             }
             if model.phase == .starting {
@@ -1815,8 +2220,28 @@ struct JoeYtNativePlayerView: View {
         .onExitCommand {
             if model.phase == .ended {
                 DiagLog.write("YT-PLAY", "slate end — về detail (trigger=menu)")
+                nav.ytPlayer = nil
+            } else if (model.phase == .starting || model.phase == .playing)
+                        && transportBarVisible {
+                // leader (owner 2026-11-23: Back better but
+                // "lúc được lúc không … giành giựt nhau";
+                // run45 log: a press at 23:49:03 closed the
+                // player while the bar was still up, while
+                // the platform rule spends that press on
+                // hiding the bar): SINGLE OWNER — while the
+                // transport bar is up, the Menu press belongs
+                // to the bar (AVKit hides it; the delegate
+                // flips transportBarVisible) and must NOT
+                // also exit. While the bar is down, one press
+                // exits. One press, one deterministic result.
+                DiagLog.write("YT-PLAY", "menu → giữ player (thanh đang hiện — lần bấm này của thanh)")
+            } else {
+                // opt-2: the exit itself was never logged —
+                // the 2026-11-22 owner log could not show
+                // which press finally reached this handler.
+                DiagLog.write("YT-PLAY", "menu → đóng player (trigger=menu)")
+                nav.ytPlayer = nil
             }
-            nav.ytPlayer = nil
         }
         .onAppear {
             model.attachStore(watch)
