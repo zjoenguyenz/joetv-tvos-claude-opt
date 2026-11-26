@@ -256,7 +256,22 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// the owner had paused — held, not recovered, until
     /// the owner's next Play (bridge, native resume, or a
     /// nonzero rate seen by the supervisor).
-    private var deferredFailure: (reason: String, loopback: Bool)?
+    private var deferredFailure: DeferredFailure?
+
+    /// FL-499 gate R1 F-C2: a held failure is stamped with
+    /// the episode (index + item identity) that produced
+    /// it. An episode transition cancels it; a release
+    /// whose stamp does not match the episode on screen
+    /// drops it — it never runs against another episode.
+    private struct DeferredFailure {
+        var reason: String
+        var loopback: Bool
+        let episodeIndex: Int
+        let itemID: ObjectIdentifier?
+        /// The owner's Play already asked for it, but the
+        /// funnel was busy (opInFlight): run when free.
+        var released = false
+    }
     private var selectionWitnessItem: ObjectIdentifier?
     private var selectionWitnessValue: String?
     private var selectionWitnessTick = 0
@@ -965,6 +980,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
                 }
             }
             recoverySpent = false
+            cancelDeferredFailure(why: "queue đã sang ep=\(index + 1) (supervisor xác nhận chuyển tập)")
             // FL-347: the new episode gets its own muxed
             // budget, and the prefetched playable is
             // promoted to current — only NOW, at the
@@ -1072,9 +1088,12 @@ final class JoeYtNativePlayerModel: ObservableObject {
         // FL-499 gate R1 F-C1: a native resume on a failed
         // item may never reach .playing/.waiting — a
         // nonzero rate is the owner's Play all the same.
-        if deferredFailure != nil, player.rate != 0 {
+        // A release the busy funnel parked (released) runs
+        // as soon as no operation is in flight.
+        if let held = deferredFailure, !opInFlight,
+           held.released || player.rate != 0 {
             ownerPaused = false
-            runDeferredFailure(trigger: "rate≠0")
+            runDeferredFailure(trigger: held.released ? "đã nhả, funnel rảnh" : "rate≠0")
         }
 
         let status = player.timeControlStatus
@@ -1655,7 +1674,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
         phase = .starting
         // FL-499 gate R1 F-C1: Thử lại is a play request.
         ownerPaused = false
-        deferredFailure = nil
+        cancelDeferredFailure(why: "Thử lại (dựng lại từ đầu)")
         recoverySpent = false
         // FL-485 (2.1.6): the retried item is a fresh
         // presentation — the ended flag and the loopback
@@ -2002,6 +2021,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
 
     private func fireAdvance() {
         guard let queued = queuedItem, player.currentItem !== queued else { return }
+        cancelDeferredFailure(why: "advance sang tập kế")
         player.advanceToNextItem()
         // An advance consumed after the current item had
         // already ENDED (the late-prefetch path) leaves
@@ -2109,10 +2129,11 @@ final class JoeYtNativePlayerModel: ObservableObject {
         // A held failure means the owner is looking at a
         // paused, failed item: whatever timeControlStatus
         // reads on that item, this press is a Play.
+        // (A stale, mismatched stamp is dropped inside and
+        // the press falls through to the normal toggle.)
         if deferredFailure != nil {
             log("remote playpause → play — chạy cứu hộ đã hoãn")
-            runDeferredFailure(trigger: "remote playpause")
-            return
+            if runDeferredFailure(trigger: "remote playpause") { return }
         }
         if player.timeControlStatus == .paused {
             ownerPaused = false
@@ -2160,23 +2181,74 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// Returns true when the failure was held.
     private func deferIfOwnerPaused(reason: String, loopback: Bool) -> Bool {
         guard ownerPaused else { return false }
-        if deferredFailure == nil {
-            deferredFailure = (reason, loopback)
-            log("item lỗi trong lúc chủ pause — hoãn cứu hộ tới lần Play kế (KHÔNG tốn recovery) — \(reason)")
+        let itemID = player.currentItem.map(ObjectIdentifier.init)
+        if var held = deferredFailure {
+            if held.episodeIndex != currentIndex || held.itemID != itemID {
+                log("lỗi hoãn cũ (ep=\(held.episodeIndex + 1)) không thuộc item hiện tại — thay bằng lỗi mới của ep=\(currentIndex + 1)")
+                deferredFailure = DeferredFailure(reason: reason, loopback: loopback,
+                                                  episodeIndex: currentIndex, itemID: itemID)
+                return true
+            }
+            // Second failure on the same held item: the
+            // regular cascade outranks the loopback retry
+            // (an origin-class failure is the more severe
+            // reading; a loopback re-present would only
+            // meet it again).
+            let wasLoopback = held.loopback
+            held.loopback = held.loopback && loopback
+            if !loopback { held.reason = reason }
+            deferredFailure = held
+            log("lỗi thứ hai trong lúc đang hoãn (ep=\(currentIndex + 1), \(loopback ? "loopback" : "cascade")) — phân loại thắng: \(held.loopback ? "loopback" : "cascade")\(wasLoopback != held.loopback ? " (đổi từ loopback)" : "")")
+            return true
         }
+        deferredFailure = DeferredFailure(reason: reason, loopback: loopback,
+                                          episodeIndex: currentIndex, itemID: itemID)
+        log("item lỗi trong lúc chủ pause — hoãn cứu hộ tới lần Play kế (KHÔNG tốn recovery, ep=\(currentIndex + 1), \(loopback ? "loopback" : "cascade")) — \(reason)")
         return true
     }
 
-    private func runDeferredFailure(trigger: String) {
-        guard let pending = deferredFailure, !terminal else { return }
-        deferredFailure = nil
+    /// Returns true when the held failure was run or
+    /// parked for the supervisor; false when there was
+    /// none or it was dropped (stamp mismatch).
+    @discardableResult
+    private func runDeferredFailure(trigger: String) -> Bool {
+        guard var pending = deferredFailure, !terminal else { return false }
+        // Stamp check: never run against another episode.
+        let itemID = player.currentItem.map(ObjectIdentifier.init)
+        if pending.episodeIndex != currentIndex
+            || (itemID != nil && itemID != pending.itemID) {
+            deferredFailure = nil
+            log("bỏ cứu hộ đã hoãn (trigger=\(trigger)) — dấu ep=\(pending.episodeIndex + 1) không khớp tập/item hiện tại ep=\(currentIndex + 1)")
+            return false
+        }
         ownerPaused = false
-        log("chạy cứu hộ đã hoãn (trigger=\(trigger)) — \(pending.reason)")
+        guard !opInFlight else {
+            // The funnel would refuse silently: keep the
+            // failure, marked released, for the supervisor
+            // to run once the operation finishes.
+            if !pending.released {
+                pending.released = true
+                deferredFailure = pending
+                log("cứu hộ đã hoãn chưa chạy được (trigger=\(trigger), đang có thao tác) — giữ lại, chạy khi rảnh")
+            }
+            return true
+        }
+        deferredFailure = nil
+        log("chạy cứu hộ đã hoãn (trigger=\(trigger), ep=\(currentIndex + 1), \(pending.loopback ? "loopback" : "cascade")) — \(pending.reason)")
         if pending.loopback {
             retryLoopbackItem(reason: pending.reason)
         } else {
             recoverOrFail(reason: pending.reason)
         }
+        return true
+    }
+
+    /// Cancels a held failure at an episode transition
+    /// (or a retry), with a log line.
+    private func cancelDeferredFailure(why: String) {
+        guard let held = deferredFailure else { return }
+        deferredFailure = nil
+        log("huỷ cứu hộ đã hoãn của ep=\(held.episodeIndex + 1) — \(why)")
     }
 
     /// FL-499 gate R1 F-C1: every rebuild completion's
