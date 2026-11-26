@@ -227,6 +227,54 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// model only carries them across items.
     private var manualSelections: [AVMediaCharacteristic: AVMediaSelectionOption?] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
+    /// FL-499 witness (log-only): timeControlStatus
+    /// transitions, so pause provenance and a double
+    /// toggle (AVKit + the Play/Pause bridge on one press)
+    /// are provable from DiagLog.
+    private var timeControlObservation: NSKeyValueObservation?
+    private var lastLoggedTimeControl: AVPlayer.TimeControlStatus?
+    /// FL-499 witness (log-only): the current item's
+    /// selected legible/audible options, re-read by the
+    /// supervisor; a change WITHIN an item is logged (the
+    /// item-start selection keeps its own line), so a
+    /// subtitle pick made in the player's panel is
+    /// provable from DiagLog.
+    /// FL-499 gate R1 F-C1: the OWNER's pause intent —
+    /// set only on positive evidence (the Play/Pause bridge
+    /// pausing, or a transition to .paused on a healthy,
+    /// not-ended item while the phase is starting/playing),
+    /// cleared by any
+    /// transition to playing/waiting and by retry().
+    /// Recovery completions consult it before play(), and
+    /// the failure funnel defers to it (deferredFailure).
+    /// A bare timeControlStatus == .paused is NOT used:
+    /// an item failure itself drops the player's rate, so
+    /// that test would also defer every failure that hits
+    /// a PLAYING episode (inference) and freeze the screen.
+    private var ownerPaused = false
+    /// FL-499 gate R1 F-C1: a failure that arrived while
+    /// the owner had paused — held, not recovered, until
+    /// the owner's next Play (bridge, native resume, or a
+    /// nonzero rate seen by the supervisor).
+    private var deferredFailure: DeferredFailure?
+
+    /// FL-499 gate R1 F-C2: a held failure is stamped with
+    /// the episode (index + item identity) that produced
+    /// it. An episode transition cancels it; a release
+    /// whose stamp does not match the episode on screen
+    /// drops it — it never runs against another episode.
+    private struct DeferredFailure {
+        var reason: String
+        var loopback: Bool
+        let episodeIndex: Int
+        let itemID: ObjectIdentifier?
+        /// The owner's Play already asked for it, but the
+        /// funnel was busy (opInFlight): run when free.
+        var released = false
+    }
+    private var selectionWitnessItem: ObjectIdentifier?
+    private var selectionWitnessValue: String?
+    private var selectionWitnessTick = 0
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     /// FL-343 (A) paused-limbo bookkeeping. The leg's
@@ -352,6 +400,21 @@ final class JoeYtNativePlayerModel: ObservableObject {
             resumeCandidateDuration = Double(row.dur) / 1000
         }
         player.automaticallyWaitsToMinimizeStalling = true
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
+            [weak self] observed, _ in
+            // Sendable values only cross to the main actor
+            // (the itemStatusObservation pattern).
+            let status = observed.timeControlStatus
+            let seconds = observed.currentTime().seconds
+            let item = observed.currentItem
+            let itemHealthy = item?.status == .readyToPlay && item?.error == nil
+            let duration = item?.duration.seconds ?? .nan
+            let atEnd = duration.isFinite && seconds.isFinite && seconds >= duration - 1
+            Task { @MainActor in
+                self?.witnessTimeControl(status, at: seconds)
+                self?.trackOwnerPause(status, itemHealthy: itemHealthy, atEnd: atEnd)
+            }
+        }
         startSupervisor()
         // The initial build chain carries the attempt
         // token like every other chain (review round 1,
@@ -391,7 +454,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             self.player.replaceCurrentItem(with: item)
             self.observeCurrentItem(item)
             self.playStartedAt = Date()
-            self.player.play()
+            self.playUnlessOwnerPaused(site: "mở player")
             self.log("mở player — ep=\(self.currentIndex + 1) kind=\(self.kindName(self.firstPlayable.kind)) itag=\(self.firstPlayable.videoItag)")
             self.startPrefetch()
         }
@@ -424,6 +487,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
         statusTask?.cancel()
         supervisorTask?.cancel()
         itemStatusObservation?.invalidate()
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         // FL-485 (2.1.6): the queued successor's
         // observation dies with the player's own.
         queuedStatusObservation?.invalidate()
@@ -575,6 +640,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             let message = errorText
                 ?? "item failed (không có error text)"
             log("item FAILED ep=\(currentIndex + 1) — \(message)")
+            let loopback = isLoopbackConnectFailure(errorDomain: errorDomain,
+                                                    errorCode: errorCode,
+                                                    errorText: errorText)
+            if deferIfOwnerPaused(reason: message, loopback: loopback) { return }
             // FL-484 (2.1.6): classify BEFORE the cascade.
             // A loopback connect refusal against the app's
             // OWN 127.0.0.1 assembly relay is a LOCAL
@@ -594,9 +663,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // handler is the single funnel for fresh open,
             // resume and autoplay-next alike — every
             // item-open surface shares this classification.
-            if isLoopbackConnectFailure(errorDomain: errorDomain,
-                                        errorCode: errorCode,
-                                        errorText: errorText) {
+            if loopback {
                 retryLoopbackItem(reason: message)
             } else {
                 recoverOrFail(reason: message)
@@ -642,6 +709,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// armed-advance consumption.
     private func retryLoopbackItem(reason: String) {
         guard !terminal, !opInFlight else { return }
+        if deferIfOwnerPaused(reason: reason, loopback: true) { return }
         guard loopbackRetries < 2, let playable = currentPlayable else {
             log("FL-484: loopback retry đã hết (hoặc không còn playable) — về cascade thường")
             recoverOrFail(reason: reason)
@@ -698,7 +766,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             self.advanceUnconfirmedSince = nil
             self.pausedStallSince = nil
             self.playStartedAt = Date()
-            self.player.play()
+            self.playUnlessOwnerPaused(site: "FL-484 loopback")
             self.opInFlight = false
             self.log("FL-484: item assembly đã dựng lại — phát ep=\(self.currentIndex + 1) từ \(Int(seekTo))s")
             if self.advancePending, !self.prefetchInFlight {
@@ -796,6 +864,9 @@ final class JoeYtNativePlayerModel: ObservableObject {
         captureManualSelections(from: player.currentItem)
         log("item hết ep=\(currentIndex + 1)")
         if !hasNextEpisode {
+            // FL-499 gate R2: nothing may recover behind
+            // the end slate.
+            cancelDeferredFailure(why: "hết tập cuối — end slate")
             phase = .ended
             log("hết tập cuối — end slate")
             return
@@ -912,6 +983,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
                 }
             }
             recoverySpent = false
+            cancelDeferredFailure(why: "queue đã sang ep=\(index + 1) (supervisor xác nhận chuyển tập)")
             // FL-347: the new episode gets its own muxed
             // budget, and the prefetched playable is
             // promoted to current — only NOW, at the
@@ -1013,6 +1085,19 @@ final class JoeYtNativePlayerModel: ObservableObject {
         if let item = player.currentItem {
             let d = item.duration.seconds
             if d.isFinite, d > 0 { currentDurationSeconds = d }
+        }
+
+        witnessMediaSelection()
+        // FL-499 gate R1 F-C1: a native resume on a failed
+        // item may never reach .playing/.waiting — a
+        // nonzero rate is the owner's Play all the same.
+        // A release the busy funnel parked (released) runs
+        // as soon as no operation is in flight.
+        if let held = deferredFailure, !opInFlight,
+           phase == .starting || phase == .playing,
+           held.released || player.rate != 0 {
+            ownerPaused = false
+            runDeferredFailure(trigger: held.released ? "đã nhả, funnel rảnh" : "rate≠0")
         }
 
         let status = player.timeControlStatus
@@ -1221,6 +1306,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
 
     private func recoverOrFail(reason: String) {
         guard !terminal, !opInFlight else { return }
+        if deferIfOwnerPaused(reason: reason, loopback: false) { return }
         if recoverySpent {
             // FL-347: the muxed tier stands in front of
             // the terminal door — a spent recovery is
@@ -1311,7 +1397,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
                     self.advanceUnconfirmedSince = nil
                     self.pausedStallSince = nil
                     self.playStartedAt = Date()
-                    self.player.play()
+                    self.playUnlessOwnerPaused(site: "re-resolve")
                     self.opInFlight = false
                     self.log("re-resolve xong — phát lại ep=\(self.currentIndex + 1) từ \(Int(seekTo))s")
                     // An advance armed while this recovery
@@ -1442,7 +1528,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
         if seekTo > 2 {
             player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600))
         }
-        player.play()
+        playUnlessOwnerPaused(site: "muxed swap")
         log("muxed swap xong — phát bản muxed ep=\(currentIndex + 1) từ \(Int(seekTo))s")
         return true
     }
@@ -1581,6 +1667,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // very episode the owner asked to replay. All
             // three recovery failure exits land here.
             advancePending = false
+            // FL-499 gate R2: a held (or parked) failure
+            // dies with the episode's native life — the
+            // slate's own retry() is the only way back.
+            cancelDeferredFailure(why: "terminal failure — tấm bảng lỗi")
             phase = .failed("Không phát được qua YouTube. Anh bấm Thử lại, hoặc quay lại rồi chọn nguồn khác.")
         }
     }
@@ -1590,6 +1680,9 @@ final class JoeYtNativePlayerModel: ObservableObject {
     func retry() {
         guard !terminal else { return }
         phase = .starting
+        // FL-499 gate R1 F-C1: Thử lại is a play request.
+        ownerPaused = false
+        cancelDeferredFailure(why: "Thử lại (dựng lại từ đầu)")
         recoverySpent = false
         // FL-485 (2.1.6): the retried item is a fresh
         // presentation — the ended flag and the loopback
@@ -1936,6 +2029,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
 
     private func fireAdvance() {
         guard let queued = queuedItem, player.currentItem !== queued else { return }
+        cancelDeferredFailure(why: "advance sang tập kế")
         player.advanceToNextItem()
         // An advance consumed after the current item had
         // already ENDED (the late-prefetch path) leaves
@@ -2024,6 +2118,215 @@ final class JoeYtNativePlayerModel: ObservableObject {
         return option.locale?.language.languageCode?.identifier ?? "?"
     }
 
+    // MARK: FL-499 — remote bridge + witnesses
+
+    /// FL-499: the CEC remote's only bar-summoning key.
+    /// AVKit surfaces and HOLDS its transport bar while the
+    /// player is paused; once the bar is up, the CEC
+    /// remote's own arrows/Select drive seek and the
+    /// subtitle/audio panel natively (owner-proven: "muốn
+    /// kéo bao nhiêu thì kéo"). Play/Pause keeps its
+    /// standard meaning — nothing is remapped — and there
+    /// is deliberately NO branch on the bar's state: one
+    /// press, one deterministic result, in every state.
+    func togglePlayPauseFromRemote() {
+        guard phase == .starting || phase == .playing else {
+            log("remote playpause → bỏ qua (phase=\(phaseName))")
+            return
+        }
+        // A held failure means the owner is looking at a
+        // paused, failed item: whatever timeControlStatus
+        // reads on that item, this press is a Play.
+        // (A stale, mismatched stamp is dropped inside and
+        // the press falls through to the normal toggle.)
+        // The verdict line (ran / parked / dropped) is
+        // written by runDeferredFailure itself — nothing is
+        // claimed here before the stamp is judged.
+        if deferredFailure != nil,
+           runDeferredFailure(trigger: "remote playpause") { return }
+        if player.timeControlStatus == .paused {
+            ownerPaused = false
+            log("remote playpause → play")
+            player.play()
+        } else {
+            log("remote playpause → pause (bar sẽ hiện)")
+            ownerPaused = true
+            player.pause()
+        }
+    }
+
+    /// FL-499 gate R1 F-C1: owner-pause bookkeeping from
+    /// the timeControlStatus KVO (covers the native
+    /// Siri/CEC play-pause path the bridge never sees).
+    private func trackOwnerPause(_ status: AVPlayer.TimeControlStatus,
+                                 itemHealthy: Bool, atEnd: Bool) {
+        guard !terminal else { return }
+        switch status {
+        case .paused:
+            // No opInFlight exclusion: a native pause during
+            // a stall-triggered rebuild (old item healthy)
+            // is the owner's too, and the rebuild's
+            // completion must honour it. Model-issued
+            // pauses all latch terminal or leave the
+            // starting/playing phases first.
+            if (phase == .starting || phase == .playing),
+               itemHealthy, !atEnd, !currentItemEnded, !ownerPaused {
+                ownerPaused = true
+                log("pause của chủ (ghi nhận) — cứu hộ sẽ không tự phát lại")
+            }
+        case .playing, .waitingToPlayAtSpecifiedRate:
+            if ownerPaused {
+                ownerPaused = false
+            }
+            if deferredFailure != nil {
+                runDeferredFailure(trigger: "resume")
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// FL-499 gate R1 F-C1: the funnel's pause gate.
+    /// Returns true when the failure was held.
+    private func deferIfOwnerPaused(reason: String, loopback: Bool) -> Bool {
+        guard ownerPaused else { return false }
+        let itemID = player.currentItem.map(ObjectIdentifier.init)
+        if var held = deferredFailure {
+            if held.episodeIndex != currentIndex || held.itemID != itemID {
+                log("lỗi hoãn cũ (ep=\(held.episodeIndex + 1)) không thuộc item hiện tại — thay bằng lỗi mới của ep=\(currentIndex + 1)")
+                deferredFailure = DeferredFailure(reason: reason, loopback: loopback,
+                                                  episodeIndex: currentIndex, itemID: itemID)
+                return true
+            }
+            // Second failure on the same held item: the
+            // regular cascade outranks the loopback retry
+            // (an origin-class failure is the more severe
+            // reading; a loopback re-present would only
+            // meet it again).
+            let wasLoopback = held.loopback
+            held.loopback = held.loopback && loopback
+            if !loopback { held.reason = reason }
+            deferredFailure = held
+            log("lỗi thứ hai trong lúc đang hoãn (ep=\(currentIndex + 1), \(loopback ? "loopback" : "cascade")) — phân loại thắng: \(held.loopback ? "loopback" : "cascade")\(wasLoopback != held.loopback ? " (đổi từ loopback)" : "")")
+            return true
+        }
+        deferredFailure = DeferredFailure(reason: reason, loopback: loopback,
+                                          episodeIndex: currentIndex, itemID: itemID)
+        log("item lỗi trong lúc chủ pause — hoãn cứu hộ tới lần Play kế (KHÔNG tốn recovery, ep=\(currentIndex + 1), \(loopback ? "loopback" : "cascade")) — \(reason)")
+        return true
+    }
+
+    /// Returns true when the held failure was run or
+    /// parked for the supervisor; false when there was
+    /// none or it was dropped (stamp mismatch).
+    @discardableResult
+    private func runDeferredFailure(trigger: String) -> Bool {
+        guard var pending = deferredFailure, !terminal else { return false }
+        // FL-499 gate R2: only a live surface may recover;
+        // on a slate (.failed / .ended) the held failure is
+        // dropped, never run.
+        guard phase == .starting || phase == .playing else {
+            deferredFailure = nil
+            log("bỏ cứu hộ đã hoãn (trigger=\(trigger)) — pha \(phaseName), không còn mặt phát")
+            return false
+        }
+        // Stamp check: never run against another episode.
+        let itemID = player.currentItem.map(ObjectIdentifier.init)
+        if pending.episodeIndex != currentIndex
+            || (itemID != nil && itemID != pending.itemID) {
+            deferredFailure = nil
+            log("bỏ cứu hộ đã hoãn (trigger=\(trigger)) — dấu ep=\(pending.episodeIndex + 1) không khớp tập/item hiện tại ep=\(currentIndex + 1)")
+            return false
+        }
+        ownerPaused = false
+        guard !opInFlight else {
+            // The funnel would refuse silently: keep the
+            // failure, marked released, for the supervisor
+            // to run once the operation finishes.
+            if !pending.released {
+                pending.released = true
+                deferredFailure = pending
+                log("cứu hộ đã hoãn chưa chạy được (trigger=\(trigger), đang có thao tác) — giữ lại, chạy khi rảnh")
+            }
+            return true
+        }
+        deferredFailure = nil
+        log("chạy cứu hộ đã hoãn (trigger=\(trigger), ep=\(currentIndex + 1), \(pending.loopback ? "loopback" : "cascade")) — \(pending.reason)")
+        if pending.loopback {
+            retryLoopbackItem(reason: pending.reason)
+        } else {
+            recoverOrFail(reason: pending.reason)
+        }
+        return true
+    }
+
+    /// Cancels a held failure at an episode transition
+    /// (or a retry), with a log line.
+    private func cancelDeferredFailure(why: String) {
+        guard let held = deferredFailure else { return }
+        deferredFailure = nil
+        log("huỷ cứu hộ đã hoãn của ep=\(held.episodeIndex + 1) — \(why)")
+    }
+
+    /// FL-499 gate R1 F-C1: every rebuild completion's
+    /// play. A rebuild that lands while the owner has
+    /// paused leaves the player paused; the owner's next
+    /// Play continues from the rebuilt item.
+    private func playUnlessOwnerPaused(site: String) {
+        if ownerPaused {
+            log("\(site): dựng xong trong lúc chủ pause — giữ pause, chờ lần Play kế")
+        } else {
+            player.play()
+        }
+    }
+
+    /// Short phase name for witness lines.
+    var phaseName: String {
+        switch phase {
+        case .starting: return "starting"
+        case .playing: return "playing"
+        case .failed: return "failed"
+        case .ended: return "ended"
+        }
+    }
+
+    private func witnessTimeControl(_ status: AVPlayer.TimeControlStatus, at seconds: Double) {
+        guard status != lastLoggedTimeControl else { return }
+        lastLoggedTimeControl = status
+        let name: String
+        switch status {
+        case .playing: name = "playing"
+        case .paused: name = "paused"
+        case .waitingToPlayAtSpecifiedRate: name = "waiting"
+        @unknown default: name = "unknown(\(status.rawValue))"
+        }
+        let at = seconds.isFinite ? String(format: "%.1f", seconds) : "?"
+        log("timeControlStatus → \(name) @ \(at)s")
+    }
+
+    /// Re-reads the current item's selection about once a
+    /// second (every 2nd supervisor tick), only once the
+    /// item is readyToPlay (its selection groups are then
+    /// loaded, so the synchronous accessor never waits).
+    /// A new item only sets the baseline — its start
+    /// selection is logged at the apply point already.
+    private func witnessMediaSelection() {
+        selectionWitnessTick += 1
+        guard selectionWitnessTick % 2 == 0,
+              let item = player.currentItem,
+              item.status == .readyToPlay else { return }
+        let value = "legible=\(selectionLanguage(of: item, characteristic: .legible)) audible=\(selectionLanguage(of: item, characteristic: .audible))"
+        let id = ObjectIdentifier(item)
+        if selectionWitnessItem != id {
+            selectionWitnessItem = id
+            selectionWitnessValue = value
+            return
+        }
+        guard value != selectionWitnessValue else { return }
+        selectionWitnessValue = value
+        log("media selection \(value) (đổi trong tập, ep=\(currentIndex + 1))")
+    }
+
     private func flashStatus(_ text: String) {
         statusLine = text
         statusTask?.cancel()
@@ -2036,6 +2339,39 @@ final class JoeYtNativePlayerModel: ObservableObject {
 }
 
 // MARK: - Player controller host
+
+/// FL-499 witness: a plain AVPlayerViewController that
+/// LOGS every press it receives and then calls super — it
+/// consumes nothing and intercepts nothing (no gesture is
+/// added: WWDC21 10191, "avoid adding extra gestures to the
+/// player"). Presses AVKit's own subviews handle (e.g. a
+/// bar dismiss) never climb to this level; the design's
+/// §1.7 table reads that case as "no press began line".
+final class JoeYtPlayerController: AVPlayerViewController {
+    var onPress: ((UIPress.PressType) -> Void)?
+
+    override func pressesBegan(_ presses: Set<UIPress>,
+                               with event: UIPressesEvent?) {
+        for press in presses { onPress?(press.type) }
+        super.pressesBegan(presses, with: event)
+    }
+
+    /// Owner-readable press names for witness lines.
+    static func name(of type: UIPress.PressType) -> String {
+        switch type {
+        case .upArrow: return "upArrow"
+        case .downArrow: return "downArrow"
+        case .leftArrow: return "leftArrow"
+        case .rightArrow: return "rightArrow"
+        case .select: return "select"
+        case .menu: return "menu"
+        case .playPause: return "playPause"
+        case .pageUp: return "pageUp"
+        case .pageDown: return "pageDown"
+        default: return "raw\(type.rawValue)"
+        }
+    }
+}
 
 /// AVPlayerViewController as the ONLY transport surface:
 /// the OS renders its focus, its panel carries the
@@ -2064,11 +2400,14 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
     /// the single-owner rule (see onExitCommand in
     /// JoeYtNativePlayerView).
     var onBarVisibility: ((Bool) -> Void)? = nil
+    /// FL-499 witness: every press the controller receives
+    /// (log-only; the controller always calls super).
+    var onPress: ((UIPress.PressType) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let controller = AVPlayerViewController()
+    func makeUIViewController(context: Context) -> JoeYtPlayerController {
+        let controller = JoeYtPlayerController()
         controller.player = player
         controller.showsPlaybackControls = true
         // opt-2 (Back fix): delegate only to LOG the
@@ -2080,17 +2419,22 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         controller.delegate = context.coordinator
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
+        context.coordinator.pressWitness = onPress
+        controller.onPress = { [weak coordinator = context.coordinator] type in
+            coordinator?.pressWitness?(type)
+        }
         applyMenuItems(to: controller, coordinator: context.coordinator)
         return controller
     }
 
-    func updateUIViewController(_ controller: AVPlayerViewController,
+    func updateUIViewController(_ controller: JoeYtPlayerController,
                                 context: Context) {
         if controller.player !== player {
             controller.player = player
         }
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
+        context.coordinator.pressWitness = onPress
         applyMenuItems(to: controller, coordinator: context.coordinator)
     }
 
@@ -2136,6 +2480,9 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         var appliedHasNext: Bool?
         var onNextEpisode: (() -> Void)?
         var onBarVisibility: ((Bool) -> Void)?
+        /// FL-499 witness sink (refreshed on every update,
+        /// so it always logs the view's current state).
+        var pressWitness: ((UIPress.PressType) -> Void)?
 
         func playerViewController(
             _ playerViewController: AVPlayerViewController,
@@ -2197,7 +2544,10 @@ struct JoeYtNativePlayerView: View {
                     player: model.player,
                     hasNextEpisode: model.hasNextEpisode,
                     onNextEpisode: { model.requestAdvance(trigger: "menu") },
-                    onBarVisibility: { transportBarVisible = $0 })
+                    onBarVisibility: { transportBarVisible = $0 },
+                    onPress: { type in
+                        DiagLog.write("YT-PLAY", "press began type=\(JoeYtPlayerController.name(of: type)) bar=\(transportBarVisible ? "hiện" : "ẩn") phase=\(model.phaseName) hasNext=\(model.hasNextEpisode)")
+                    })
                     .ignoresSafeArea()
             }
             if model.phase == .starting {
@@ -2221,27 +2571,33 @@ struct JoeYtNativePlayerView: View {
             if model.phase == .ended {
                 DiagLog.write("YT-PLAY", "slate end — về detail (trigger=menu)")
                 nav.ytPlayer = nil
-            } else if (model.phase == .starting || model.phase == .playing)
-                        && transportBarVisible {
-                // leader (owner 2026-11-23: Back better but
-                // "lúc được lúc không … giành giựt nhau";
-                // run45 log: a press at 23:49:03 closed the
-                // player while the bar was still up, while
-                // the platform rule spends that press on
-                // hiding the bar): SINGLE OWNER — while the
-                // transport bar is up, the Menu press belongs
-                // to the bar (AVKit hides it; the delegate
-                // flips transportBarVisible) and must NOT
-                // also exit. While the bar is down, one press
-                // exits. One press, one deterministic result.
-                DiagLog.write("YT-PLAY", "menu → giữ player (thanh đang hiện — lần bấm này của thanh)")
             } else {
-                // opt-2: the exit itself was never logged —
-                // the 2026-11-22 owner log could not show
-                // which press finally reached this handler.
+                // FL-499 (owner 2026-11-25: Back while the bar
+                // is up did nothing until the bar auto-hid):
+                // the 2026-11-23 stand-down branch is DELETED.
+                // It spent a bar-up Menu press on nothing, on
+                // the undocumented assumption that AVKit hides
+                // the bar with that same press — and during
+                // .starting (bar state initially "hiện") it
+                // also stopped Back from cancelling a loading
+                // episode. Every Menu press that reaches this
+                // handler now exits, in every bar state: one
+                // arbiter, one outcome. Bar state is kept only
+                // for the witness lines. Accepted trade-off:
+                // a Siri Menu press that reaches the app with
+                // the bar up exits at once instead of
+                // dismissing the bar first.
+                // opt-2: the exit itself is logged.
                 DiagLog.write("YT-PLAY", "menu → đóng player (trigger=menu)")
                 nav.ytPlayer = nil
             }
+        }
+        // FL-499 summon bridge: Play/Pause → toggle. Pausing
+        // makes AVKit surface and hold its transport bar, the
+        // one way a CEC remote (no touch surface) can bring the
+        // bar back mid-episode. Consumes only Play/Pause.
+        .onPlayPauseCommand {
+            model.togglePlayPauseFromRemote()
         }
         .onAppear {
             model.attachStore(watch)
