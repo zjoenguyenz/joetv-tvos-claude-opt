@@ -227,6 +227,21 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// model only carries them across items.
     private var manualSelections: [AVMediaCharacteristic: AVMediaSelectionOption?] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
+    /// FL-499 witness (log-only): timeControlStatus
+    /// transitions, so pause provenance and a double
+    /// toggle (AVKit + the Play/Pause bridge on one press)
+    /// are provable from DiagLog.
+    private var timeControlObservation: NSKeyValueObservation?
+    private var lastLoggedTimeControl: AVPlayer.TimeControlStatus?
+    /// FL-499 witness (log-only): the current item's
+    /// selected legible/audible options, re-read by the
+    /// supervisor; a change WITHIN an item is logged (the
+    /// item-start selection keeps its own line), so a
+    /// subtitle pick made in the player's panel is
+    /// provable from DiagLog.
+    private var selectionWitnessItem: ObjectIdentifier?
+    private var selectionWitnessValue: String?
+    private var selectionWitnessTick = 0
     private var endObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     /// FL-343 (A) paused-limbo bookkeeping. The leg's
@@ -352,6 +367,16 @@ final class JoeYtNativePlayerModel: ObservableObject {
             resumeCandidateDuration = Double(row.dur) / 1000
         }
         player.automaticallyWaitsToMinimizeStalling = true
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
+            [weak self] observed, _ in
+            // Sendable values only cross to the main actor
+            // (the itemStatusObservation pattern).
+            let status = observed.timeControlStatus
+            let seconds = observed.currentTime().seconds
+            Task { @MainActor in
+                self?.witnessTimeControl(status, at: seconds)
+            }
+        }
         startSupervisor()
         // The initial build chain carries the attempt
         // token like every other chain (review round 1,
@@ -424,6 +449,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
         statusTask?.cancel()
         supervisorTask?.cancel()
         itemStatusObservation?.invalidate()
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         // FL-485 (2.1.6): the queued successor's
         // observation dies with the player's own.
         queuedStatusObservation?.invalidate()
@@ -1014,6 +1041,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
             let d = item.duration.seconds
             if d.isFinite, d > 0 { currentDurationSeconds = d }
         }
+
+        witnessMediaSelection()
 
         let status = player.timeControlStatus
         if status == .playing {
@@ -2024,6 +2053,78 @@ final class JoeYtNativePlayerModel: ObservableObject {
         return option.locale?.language.languageCode?.identifier ?? "?"
     }
 
+    // MARK: FL-499 — remote bridge + witnesses
+
+    /// FL-499: the CEC remote's only bar-summoning key.
+    /// AVKit surfaces and HOLDS its transport bar while the
+    /// player is paused; once the bar is up, the CEC
+    /// remote's own arrows/Select drive seek and the
+    /// subtitle/audio panel natively (owner-proven: "muốn
+    /// kéo bao nhiêu thì kéo"). Play/Pause keeps its
+    /// standard meaning — nothing is remapped — and there
+    /// is deliberately NO branch on the bar's state: one
+    /// press, one deterministic result, in every state.
+    func togglePlayPauseFromRemote() {
+        guard phase == .starting || phase == .playing else {
+            log("remote playpause → bỏ qua (phase=\(phaseName))")
+            return
+        }
+        if player.timeControlStatus == .paused {
+            log("remote playpause → play")
+            player.play()
+        } else {
+            log("remote playpause → pause (bar sẽ hiện)")
+            player.pause()
+        }
+    }
+
+    /// Short phase name for witness lines.
+    var phaseName: String {
+        switch phase {
+        case .starting: return "starting"
+        case .playing: return "playing"
+        case .failed: return "failed"
+        case .ended: return "ended"
+        }
+    }
+
+    private func witnessTimeControl(_ status: AVPlayer.TimeControlStatus, at seconds: Double) {
+        guard status != lastLoggedTimeControl else { return }
+        lastLoggedTimeControl = status
+        let name: String
+        switch status {
+        case .playing: name = "playing"
+        case .paused: name = "paused"
+        case .waitingToPlayAtSpecifiedRate: name = "waiting"
+        @unknown default: name = "unknown(\(status.rawValue))"
+        }
+        let at = seconds.isFinite ? String(format: "%.1f", seconds) : "?"
+        log("timeControlStatus → \(name) @ \(at)s")
+    }
+
+    /// Re-reads the current item's selection about once a
+    /// second (every 2nd supervisor tick), only once the
+    /// item is readyToPlay (its selection groups are then
+    /// loaded, so the synchronous accessor never waits).
+    /// A new item only sets the baseline — its start
+    /// selection is logged at the apply point already.
+    private func witnessMediaSelection() {
+        selectionWitnessTick += 1
+        guard selectionWitnessTick % 2 == 0,
+              let item = player.currentItem,
+              item.status == .readyToPlay else { return }
+        let value = "legible=\(selectionLanguage(of: item, characteristic: .legible)) audible=\(selectionLanguage(of: item, characteristic: .audible))"
+        let id = ObjectIdentifier(item)
+        if selectionWitnessItem != id {
+            selectionWitnessItem = id
+            selectionWitnessValue = value
+            return
+        }
+        guard value != selectionWitnessValue else { return }
+        selectionWitnessValue = value
+        log("media selection \(value) (đổi trong tập, ep=\(currentIndex + 1))")
+    }
+
     private func flashStatus(_ text: String) {
         statusLine = text
         statusTask?.cancel()
@@ -2036,6 +2137,39 @@ final class JoeYtNativePlayerModel: ObservableObject {
 }
 
 // MARK: - Player controller host
+
+/// FL-499 witness: a plain AVPlayerViewController that
+/// LOGS every press it receives and then calls super — it
+/// consumes nothing and intercepts nothing (no gesture is
+/// added: WWDC21 10191, "avoid adding extra gestures to the
+/// player"). Presses AVKit's own subviews handle (e.g. a
+/// bar dismiss) never climb to this level; the design's
+/// §1.7 table reads that case as "no press began line".
+final class JoeYtPlayerController: AVPlayerViewController {
+    var onPress: ((UIPress.PressType) -> Void)?
+
+    override func pressesBegan(_ presses: Set<UIPress>,
+                               with event: UIPressesEvent?) {
+        for press in presses { onPress?(press.type) }
+        super.pressesBegan(presses, with: event)
+    }
+
+    /// Owner-readable press names for witness lines.
+    static func name(of type: UIPress.PressType) -> String {
+        switch type {
+        case .upArrow: return "upArrow"
+        case .downArrow: return "downArrow"
+        case .leftArrow: return "leftArrow"
+        case .rightArrow: return "rightArrow"
+        case .select: return "select"
+        case .menu: return "menu"
+        case .playPause: return "playPause"
+        case .pageUp: return "pageUp"
+        case .pageDown: return "pageDown"
+        default: return "raw\(type.rawValue)"
+        }
+    }
+}
 
 /// AVPlayerViewController as the ONLY transport surface:
 /// the OS renders its focus, its panel carries the
@@ -2064,11 +2198,14 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
     /// the single-owner rule (see onExitCommand in
     /// JoeYtNativePlayerView).
     var onBarVisibility: ((Bool) -> Void)? = nil
+    /// FL-499 witness: every press the controller receives
+    /// (log-only; the controller always calls super).
+    var onPress: ((UIPress.PressType) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let controller = AVPlayerViewController()
+    func makeUIViewController(context: Context) -> JoeYtPlayerController {
+        let controller = JoeYtPlayerController()
         controller.player = player
         controller.showsPlaybackControls = true
         // opt-2 (Back fix): delegate only to LOG the
@@ -2080,17 +2217,22 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         controller.delegate = context.coordinator
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
+        context.coordinator.pressWitness = onPress
+        controller.onPress = { [weak coordinator = context.coordinator] type in
+            coordinator?.pressWitness?(type)
+        }
         applyMenuItems(to: controller, coordinator: context.coordinator)
         return controller
     }
 
-    func updateUIViewController(_ controller: AVPlayerViewController,
+    func updateUIViewController(_ controller: JoeYtPlayerController,
                                 context: Context) {
         if controller.player !== player {
             controller.player = player
         }
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
+        context.coordinator.pressWitness = onPress
         applyMenuItems(to: controller, coordinator: context.coordinator)
     }
 
@@ -2136,6 +2278,9 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         var appliedHasNext: Bool?
         var onNextEpisode: (() -> Void)?
         var onBarVisibility: ((Bool) -> Void)?
+        /// FL-499 witness sink (refreshed on every update,
+        /// so it always logs the view's current state).
+        var pressWitness: ((UIPress.PressType) -> Void)?
 
         func playerViewController(
             _ playerViewController: AVPlayerViewController,
@@ -2197,7 +2342,10 @@ struct JoeYtNativePlayerView: View {
                     player: model.player,
                     hasNextEpisode: model.hasNextEpisode,
                     onNextEpisode: { model.requestAdvance(trigger: "menu") },
-                    onBarVisibility: { transportBarVisible = $0 })
+                    onBarVisibility: { transportBarVisible = $0 },
+                    onPress: { type in
+                        DiagLog.write("YT-PLAY", "press began type=\(JoeYtPlayerController.name(of: type)) bar=\(transportBarVisible ? "hiện" : "ẩn") phase=\(model.phaseName) hasNext=\(model.hasNextEpisode)")
+                    })
                     .ignoresSafeArea()
             }
             if model.phase == .starting {
@@ -2221,27 +2369,33 @@ struct JoeYtNativePlayerView: View {
             if model.phase == .ended {
                 DiagLog.write("YT-PLAY", "slate end — về detail (trigger=menu)")
                 nav.ytPlayer = nil
-            } else if (model.phase == .starting || model.phase == .playing)
-                        && transportBarVisible {
-                // leader (owner 2026-11-23: Back better but
-                // "lúc được lúc không … giành giựt nhau";
-                // run45 log: a press at 23:49:03 closed the
-                // player while the bar was still up, while
-                // the platform rule spends that press on
-                // hiding the bar): SINGLE OWNER — while the
-                // transport bar is up, the Menu press belongs
-                // to the bar (AVKit hides it; the delegate
-                // flips transportBarVisible) and must NOT
-                // also exit. While the bar is down, one press
-                // exits. One press, one deterministic result.
-                DiagLog.write("YT-PLAY", "menu → giữ player (thanh đang hiện — lần bấm này của thanh)")
             } else {
-                // opt-2: the exit itself was never logged —
-                // the 2026-11-22 owner log could not show
-                // which press finally reached this handler.
+                // FL-499 (owner 2026-11-25: Back while the bar
+                // is up did nothing until the bar auto-hid):
+                // the 2026-11-23 stand-down branch is DELETED.
+                // It spent a bar-up Menu press on nothing, on
+                // the undocumented assumption that AVKit hides
+                // the bar with that same press — and during
+                // .starting (bar state initially "hiện") it
+                // also stopped Back from cancelling a loading
+                // episode. Every Menu press that reaches this
+                // handler now exits, in every bar state: one
+                // arbiter, one outcome. Bar state is kept only
+                // for the witness lines. Accepted trade-off:
+                // a Siri Menu press that reaches the app with
+                // the bar up exits at once instead of
+                // dismissing the bar first.
+                // opt-2: the exit itself is logged.
                 DiagLog.write("YT-PLAY", "menu → đóng player (trigger=menu)")
                 nav.ytPlayer = nil
             }
+        }
+        // FL-499 summon bridge: Play/Pause → toggle. Pausing
+        // makes AVKit surface and hold its transport bar, the
+        // one way a CEC remote (no touch surface) can bring the
+        // bar back mid-episode. Consumes only Play/Pause.
+        .onPlayPauseCommand {
+            model.togglePlayPauseFromRemote()
         }
         .onAppear {
             model.attachStore(watch)
