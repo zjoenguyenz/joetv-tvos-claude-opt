@@ -2106,15 +2106,18 @@ final class JoeYtNativePlayerModel: ObservableObject {
             log("remote playpause → bỏ qua (phase=\(phaseName))")
             return
         }
+        // A held failure means the owner is looking at a
+        // paused, failed item: whatever timeControlStatus
+        // reads on that item, this press is a Play.
+        if deferredFailure != nil {
+            log("remote playpause → play — chạy cứu hộ đã hoãn")
+            runDeferredFailure(trigger: "remote playpause")
+            return
+        }
         if player.timeControlStatus == .paused {
             ownerPaused = false
-            if deferredFailure != nil {
-                log("remote playpause → play — chạy cứu hộ đã hoãn")
-                runDeferredFailure(trigger: "remote playpause")
-            } else {
-                log("remote playpause → play")
-                player.play()
-            }
+            log("remote playpause → play")
+            player.play()
         } else {
             log("remote playpause → pause (bar sẽ hiện)")
             ownerPaused = true
