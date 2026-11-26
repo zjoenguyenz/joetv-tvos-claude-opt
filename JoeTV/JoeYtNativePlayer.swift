@@ -239,6 +239,24 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// item-start selection keeps its own line), so a
     /// subtitle pick made in the player's panel is
     /// provable from DiagLog.
+    /// FL-499 gate R1 F-C1: the OWNER's pause intent —
+    /// set only on positive evidence (the Play/Pause bridge
+    /// pausing, or a transition to .paused on a healthy,
+    /// not-ended item while the phase is starting/playing),
+    /// cleared by any
+    /// transition to playing/waiting and by retry().
+    /// Recovery completions consult it before play(), and
+    /// the failure funnel defers to it (deferredFailure).
+    /// A bare timeControlStatus == .paused is NOT used:
+    /// an item failure itself drops the player's rate, so
+    /// that test would also defer every failure that hits
+    /// a PLAYING episode (inference) and freeze the screen.
+    private var ownerPaused = false
+    /// FL-499 gate R1 F-C1: a failure that arrived while
+    /// the owner had paused — held, not recovered, until
+    /// the owner's next Play (bridge, native resume, or a
+    /// nonzero rate seen by the supervisor).
+    private var deferredFailure: (reason: String, loopback: Bool)?
     private var selectionWitnessItem: ObjectIdentifier?
     private var selectionWitnessValue: String?
     private var selectionWitnessTick = 0
@@ -373,8 +391,13 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // (the itemStatusObservation pattern).
             let status = observed.timeControlStatus
             let seconds = observed.currentTime().seconds
+            let item = observed.currentItem
+            let itemHealthy = item?.status == .readyToPlay && item?.error == nil
+            let duration = item?.duration.seconds ?? .nan
+            let atEnd = duration.isFinite && seconds.isFinite && seconds >= duration - 1
             Task { @MainActor in
                 self?.witnessTimeControl(status, at: seconds)
+                self?.trackOwnerPause(status, itemHealthy: itemHealthy, atEnd: atEnd)
             }
         }
         startSupervisor()
@@ -416,7 +439,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             self.player.replaceCurrentItem(with: item)
             self.observeCurrentItem(item)
             self.playStartedAt = Date()
-            self.player.play()
+            self.playUnlessOwnerPaused(site: "mở player")
             self.log("mở player — ep=\(self.currentIndex + 1) kind=\(self.kindName(self.firstPlayable.kind)) itag=\(self.firstPlayable.videoItag)")
             self.startPrefetch()
         }
@@ -602,6 +625,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             let message = errorText
                 ?? "item failed (không có error text)"
             log("item FAILED ep=\(currentIndex + 1) — \(message)")
+            let loopback = isLoopbackConnectFailure(errorDomain: errorDomain,
+                                                    errorCode: errorCode,
+                                                    errorText: errorText)
+            if deferIfOwnerPaused(reason: message, loopback: loopback) { return }
             // FL-484 (2.1.6): classify BEFORE the cascade.
             // A loopback connect refusal against the app's
             // OWN 127.0.0.1 assembly relay is a LOCAL
@@ -621,9 +648,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // handler is the single funnel for fresh open,
             // resume and autoplay-next alike — every
             // item-open surface shares this classification.
-            if isLoopbackConnectFailure(errorDomain: errorDomain,
-                                        errorCode: errorCode,
-                                        errorText: errorText) {
+            if loopback {
                 retryLoopbackItem(reason: message)
             } else {
                 recoverOrFail(reason: message)
@@ -669,6 +694,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// armed-advance consumption.
     private func retryLoopbackItem(reason: String) {
         guard !terminal, !opInFlight else { return }
+        if deferIfOwnerPaused(reason: reason, loopback: true) { return }
         guard loopbackRetries < 2, let playable = currentPlayable else {
             log("FL-484: loopback retry đã hết (hoặc không còn playable) — về cascade thường")
             recoverOrFail(reason: reason)
@@ -725,7 +751,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             self.advanceUnconfirmedSince = nil
             self.pausedStallSince = nil
             self.playStartedAt = Date()
-            self.player.play()
+            self.playUnlessOwnerPaused(site: "FL-484 loopback")
             self.opInFlight = false
             self.log("FL-484: item assembly đã dựng lại — phát ep=\(self.currentIndex + 1) từ \(Int(seekTo))s")
             if self.advancePending, !self.prefetchInFlight {
@@ -1043,6 +1069,13 @@ final class JoeYtNativePlayerModel: ObservableObject {
         }
 
         witnessMediaSelection()
+        // FL-499 gate R1 F-C1: a native resume on a failed
+        // item may never reach .playing/.waiting — a
+        // nonzero rate is the owner's Play all the same.
+        if deferredFailure != nil, player.rate != 0 {
+            ownerPaused = false
+            runDeferredFailure(trigger: "rate≠0")
+        }
 
         let status = player.timeControlStatus
         if status == .playing {
@@ -1250,6 +1283,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
 
     private func recoverOrFail(reason: String) {
         guard !terminal, !opInFlight else { return }
+        if deferIfOwnerPaused(reason: reason, loopback: false) { return }
         if recoverySpent {
             // FL-347: the muxed tier stands in front of
             // the terminal door — a spent recovery is
@@ -1340,7 +1374,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
                     self.advanceUnconfirmedSince = nil
                     self.pausedStallSince = nil
                     self.playStartedAt = Date()
-                    self.player.play()
+                    self.playUnlessOwnerPaused(site: "re-resolve")
                     self.opInFlight = false
                     self.log("re-resolve xong — phát lại ep=\(self.currentIndex + 1) từ \(Int(seekTo))s")
                     // An advance armed while this recovery
@@ -1471,7 +1505,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
         if seekTo > 2 {
             player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600))
         }
-        player.play()
+        playUnlessOwnerPaused(site: "muxed swap")
         log("muxed swap xong — phát bản muxed ep=\(currentIndex + 1) từ \(Int(seekTo))s")
         return true
     }
@@ -1619,6 +1653,9 @@ final class JoeYtNativePlayerModel: ObservableObject {
     func retry() {
         guard !terminal else { return }
         phase = .starting
+        // FL-499 gate R1 F-C1: Thử lại is a play request.
+        ownerPaused = false
+        deferredFailure = nil
         recoverySpent = false
         // FL-485 (2.1.6): the retried item is a fresh
         // presentation — the ended flag and the loopback
@@ -2070,11 +2107,84 @@ final class JoeYtNativePlayerModel: ObservableObject {
             return
         }
         if player.timeControlStatus == .paused {
-            log("remote playpause → play")
-            player.play()
+            ownerPaused = false
+            if deferredFailure != nil {
+                log("remote playpause → play — chạy cứu hộ đã hoãn")
+                runDeferredFailure(trigger: "remote playpause")
+            } else {
+                log("remote playpause → play")
+                player.play()
+            }
         } else {
             log("remote playpause → pause (bar sẽ hiện)")
+            ownerPaused = true
             player.pause()
+        }
+    }
+
+    /// FL-499 gate R1 F-C1: owner-pause bookkeeping from
+    /// the timeControlStatus KVO (covers the native
+    /// Siri/CEC play-pause path the bridge never sees).
+    private func trackOwnerPause(_ status: AVPlayer.TimeControlStatus,
+                                 itemHealthy: Bool, atEnd: Bool) {
+        guard !terminal else { return }
+        switch status {
+        case .paused:
+            // No opInFlight exclusion: a native pause during
+            // a stall-triggered rebuild (old item healthy)
+            // is the owner's too, and the rebuild's
+            // completion must honour it. Model-issued
+            // pauses all latch terminal or leave the
+            // starting/playing phases first.
+            if (phase == .starting || phase == .playing),
+               itemHealthy, !atEnd, !currentItemEnded, !ownerPaused {
+                ownerPaused = true
+                log("pause của chủ (ghi nhận) — cứu hộ sẽ không tự phát lại")
+            }
+        case .playing, .waitingToPlayAtSpecifiedRate:
+            if ownerPaused {
+                ownerPaused = false
+            }
+            if deferredFailure != nil {
+                runDeferredFailure(trigger: "resume")
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// FL-499 gate R1 F-C1: the funnel's pause gate.
+    /// Returns true when the failure was held.
+    private func deferIfOwnerPaused(reason: String, loopback: Bool) -> Bool {
+        guard ownerPaused else { return false }
+        if deferredFailure == nil {
+            deferredFailure = (reason, loopback)
+            log("item lỗi trong lúc chủ pause — hoãn cứu hộ tới lần Play kế (KHÔNG tốn recovery) — \(reason)")
+        }
+        return true
+    }
+
+    private func runDeferredFailure(trigger: String) {
+        guard let pending = deferredFailure, !terminal else { return }
+        deferredFailure = nil
+        ownerPaused = false
+        log("chạy cứu hộ đã hoãn (trigger=\(trigger)) — \(pending.reason)")
+        if pending.loopback {
+            retryLoopbackItem(reason: pending.reason)
+        } else {
+            recoverOrFail(reason: pending.reason)
+        }
+    }
+
+    /// FL-499 gate R1 F-C1: every rebuild completion's
+    /// play. A rebuild that lands while the owner has
+    /// paused leaves the player paused; the owner's next
+    /// Play continues from the rebuilt item.
+    private func playUnlessOwnerPaused(site: String) {
+        if ownerPaused {
+            log("\(site): dựng xong trong lúc chủ pause — giữ pause, chờ lần Play kế")
+        } else {
+            player.play()
         }
     }
 
