@@ -864,6 +864,9 @@ final class JoeYtNativePlayerModel: ObservableObject {
         captureManualSelections(from: player.currentItem)
         log("item hết ep=\(currentIndex + 1)")
         if !hasNextEpisode {
+            // FL-499 gate R2: nothing may recover behind
+            // the end slate.
+            cancelDeferredFailure(why: "hết tập cuối — end slate")
             phase = .ended
             log("hết tập cuối — end slate")
             return
@@ -1091,6 +1094,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
         // A release the busy funnel parked (released) runs
         // as soon as no operation is in flight.
         if let held = deferredFailure, !opInFlight,
+           phase == .starting || phase == .playing,
            held.released || player.rate != 0 {
             ownerPaused = false
             runDeferredFailure(trigger: held.released ? "đã nhả, funnel rảnh" : "rate≠0")
@@ -1663,6 +1667,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // very episode the owner asked to replay. All
             // three recovery failure exits land here.
             advancePending = false
+            // FL-499 gate R2: a held (or parked) failure
+            // dies with the episode's native life — the
+            // slate's own retry() is the only way back.
+            cancelDeferredFailure(why: "terminal failure — tấm bảng lỗi")
             phase = .failed("Không phát được qua YouTube. Anh bấm Thử lại, hoặc quay lại rồi chọn nguồn khác.")
         }
     }
@@ -2131,10 +2139,11 @@ final class JoeYtNativePlayerModel: ObservableObject {
         // reads on that item, this press is a Play.
         // (A stale, mismatched stamp is dropped inside and
         // the press falls through to the normal toggle.)
-        if deferredFailure != nil {
-            log("remote playpause → play — chạy cứu hộ đã hoãn")
-            if runDeferredFailure(trigger: "remote playpause") { return }
-        }
+        // The verdict line (ran / parked / dropped) is
+        // written by runDeferredFailure itself — nothing is
+        // claimed here before the stamp is judged.
+        if deferredFailure != nil,
+           runDeferredFailure(trigger: "remote playpause") { return }
         if player.timeControlStatus == .paused {
             ownerPaused = false
             log("remote playpause → play")
@@ -2213,6 +2222,14 @@ final class JoeYtNativePlayerModel: ObservableObject {
     @discardableResult
     private func runDeferredFailure(trigger: String) -> Bool {
         guard var pending = deferredFailure, !terminal else { return false }
+        // FL-499 gate R2: only a live surface may recover;
+        // on a slate (.failed / .ended) the held failure is
+        // dropped, never run.
+        guard phase == .starting || phase == .playing else {
+            deferredFailure = nil
+            log("bỏ cứu hộ đã hoãn (trigger=\(trigger)) — pha \(phaseName), không còn mặt phát")
+            return false
+        }
         // Stamp check: never run against another episode.
         let itemID = player.currentItem.map(ObjectIdentifier.init)
         if pending.episodeIndex != currentIndex
