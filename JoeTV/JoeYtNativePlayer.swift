@@ -2539,6 +2539,10 @@ final class JoeYtPlayerHost: UIViewController {
     private var dismissing = false
     /// the user dismissed: never present again.
     private var userDismissed = false
+    /// F-B1: a route dismissal was asked for — the surface
+    /// is leaving: never present again (the phase may
+    /// still read .playing, so wantsLive stays true).
+    private var routeDismissed = false
     /// UIKit confirmed the presentation (its completion
     /// ran). A dismissal asked for before that is held
     /// and run from the completion — UIKit does not
@@ -2601,7 +2605,7 @@ final class JoeYtPlayerHost: UIViewController {
 
     private func reconcile() {
         if wantsLive {
-            guard !presented, !dismissing, !userDismissed else { return }
+            guard !presented, !dismissing, !userDismissed, !routeDismissed else { return }
             guard appeared, view.window != nil else { return }
             if let other = presentedViewController {
                 log("player modal — chưa present được: đang có \(type(of: other)) che")
@@ -2634,6 +2638,12 @@ final class JoeYtPlayerHost: UIViewController {
     /// Runs `then` once the modal is gone; never mutates
     /// navigation itself.
     func dismissPlayer(trigger: String, then: (@MainActor () -> Void)?) {
+        // F-B1: latch BEFORE anything runs, so neither the
+        // reconcile() at the end of finishProgrammaticDismiss
+        // nor any later SwiftUI update can re-present over
+        // the destination; with presented=false after it,
+        // dismantle's guard makes no second dismissal.
+        if trigger == "route" { routeDismissed = true }
         guard presented else {
             if trigger != "slate" {
                 log("đóng player (trigger=\(trigger)) — modal không mở, đi thẳng")
