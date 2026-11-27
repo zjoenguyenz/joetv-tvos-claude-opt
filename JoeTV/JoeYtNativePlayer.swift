@@ -228,9 +228,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
     private var manualSelections: [AVMediaCharacteristic: AVMediaSelectionOption?] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
     /// FL-499 witness (log-only): timeControlStatus
-    /// transitions, so pause provenance and a double
-    /// toggle (AVKit + the Play/Pause bridge on one press)
-    /// are provable from DiagLog.
+    /// transitions, so pause provenance is provable from
+    /// DiagLog.
     private var timeControlObservation: NSKeyValueObservation?
     private var lastLoggedTimeControl: AVPlayer.TimeControlStatus?
     /// FL-499 witness (log-only): the current item's
@@ -240,9 +239,10 @@ final class JoeYtNativePlayerModel: ObservableObject {
     /// subtitle pick made in the player's panel is
     /// provable from DiagLog.
     /// FL-499 gate R1 F-C1: the OWNER's pause intent —
-    /// set only on positive evidence (the Play/Pause bridge
-    /// pausing, or a transition to .paused on a healthy,
-    /// not-ended item while the phase is starting/playing),
+    /// set only on positive evidence (a transition to
+    /// .paused on a healthy, not-ended item while the
+    /// phase is starting/playing — Brief 2: the KVO is the
+    /// only source, the Play/Pause bridge is deleted),
     /// cleared by any
     /// transition to playing/waiting and by retry().
     /// Recovery completions consult it before play(), and
@@ -254,8 +254,8 @@ final class JoeYtNativePlayerModel: ObservableObject {
     private var ownerPaused = false
     /// FL-499 gate R1 F-C1: a failure that arrived while
     /// the owner had paused — held, not recovered, until
-    /// the owner's next Play (bridge, native resume, or a
-    /// nonzero rate seen by the supervisor).
+    /// the owner's next Play (native resume seen by the
+    /// KVO, or a nonzero rate seen by the supervisor).
     private var deferredFailure: DeferredFailure?
 
     /// FL-499 gate R1 F-C2: a held failure is stamped with
@@ -636,6 +636,7 @@ final class JoeYtNativePlayerModel: ObservableObject {
             // log; this line is that log, at the call
             // point, once per item.)
             log("media selection ep=\(currentIndex + 1): legible=\(selectionLanguage(of: player.currentItem, characteristic: .legible)) audible=\(selectionLanguage(of: player.currentItem, characteristic: .audible))")
+            log("item start ep=\(currentIndex + 1): \(seekWitness(of: player.currentItem))")
         case .failed:
             let message = errorText
                 ?? "item failed (không có error text)"
@@ -2118,46 +2119,32 @@ final class JoeYtNativePlayerModel: ObservableObject {
         return option.locale?.language.languageCode?.identifier ?? "?"
     }
 
-    // MARK: FL-499 — remote bridge + witnesses
+    // MARK: FL-499 — witnesses + owner-pause bookkeeping
 
-    /// FL-499: the CEC remote's only bar-summoning key.
-    /// AVKit surfaces and HOLDS its transport bar while the
-    /// player is paused; once the bar is up, the CEC
-    /// remote's own arrows/Select drive seek and the
-    /// subtitle/audio panel natively (owner-proven: "muốn
-    /// kéo bao nhiêu thì kéo"). Play/Pause keeps its
-    /// standard meaning — nothing is remapped — and there
-    /// is deliberately NO branch on the bar's state: one
-    /// press, one deterministic result, in every state.
-    func togglePlayPauseFromRemote() {
-        guard phase == .starting || phase == .playing else {
-            log("remote playpause → bỏ qua (phase=\(phaseName))")
-            return
+    /// FL-499 Brief 2 witness (log-only): the item's
+    /// seekable ranges and duration at item start, so a
+    /// scrub that does not move is attributable from
+    /// DiagLog (empty/indefinite ranges vs. a live
+    /// transport refusing).
+    private func seekWitness(of item: AVPlayerItem?) -> String {
+        guard let item else { return "seekable=none duration=none" }
+        let ranges = item.seekableTimeRanges.map { value -> String in
+            let range = value.timeRangeValue
+            return "\(Self.witnessTime(range.start))–\(Self.witnessTime(range.end))"
         }
-        // A held failure means the owner is looking at a
-        // paused, failed item: whatever timeControlStatus
-        // reads on that item, this press is a Play.
-        // (A stale, mismatched stamp is dropped inside and
-        // the press falls through to the normal toggle.)
-        // The verdict line (ran / parked / dropped) is
-        // written by runDeferredFailure itself — nothing is
-        // claimed here before the stamp is judged.
-        if deferredFailure != nil,
-           runDeferredFailure(trigger: "remote playpause") { return }
-        if player.timeControlStatus == .paused {
-            ownerPaused = false
-            log("remote playpause → play")
-            player.play()
-        } else {
-            log("remote playpause → pause (bar sẽ hiện)")
-            ownerPaused = true
-            player.pause()
-        }
+        return "seekable=[\(ranges.joined(separator: ","))] duration=\(Self.witnessTime(item.duration))"
+    }
+
+    private static func witnessTime(_ time: CMTime) -> String {
+        if time.isIndefinite { return "indefinite" }
+        guard time.isNumeric else { return "invalid" }
+        return String(format: "%.1fs", time.seconds)
     }
 
     /// FL-499 gate R1 F-C1: owner-pause bookkeeping from
-    /// the timeControlStatus KVO (covers the native
-    /// Siri/CEC play-pause path the bridge never sees).
+    /// the timeControlStatus KVO — the ONLY source since
+    /// Brief 2 deleted the Play/Pause bridge (Siri and CEC
+    /// play/pause both reach AVKit natively).
     private func trackOwnerPause(_ status: AVPlayer.TimeControlStatus,
                                  itemHealthy: Bool, atEnd: Bool) {
         guard !terminal else { return }
@@ -2356,6 +2343,18 @@ final class JoeYtPlayerController: AVPlayerViewController {
         super.pressesBegan(presses, with: event)
     }
 
+    /// FL-499 Brief 2: the host's second witness of the
+    /// end of a modal dismissal (the first is the delegate's
+    /// playerViewControllerDidEndDismissalTransition). The
+    /// host de-duplicates; this observes only — super runs
+    /// first and nothing is changed.
+    var onDismissedDisappear: (() -> Void)?
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        if isBeingDismissed { onDismissedDisappear?() }
+    }
+
     /// Owner-readable press names for witness lines.
     static func name(of type: UIPress.PressType) -> String {
         switch type {
@@ -2370,6 +2369,345 @@ final class JoeYtPlayerController: AVPlayerViewController {
         case .pageDown: return "pageDown"
         default: return "raw\(type.rawValue)"
         }
+    }
+}
+
+// MARK: - FL-499 Brief 2: modal presentation
+
+/// FL-499 Brief 2 §3: the ONE funnel for every
+/// programmatic route out of the live player. A route
+/// that leaves the player (chain fall-through, detail
+/// hand-back, page fallback) dismisses the modal FIRST
+/// and mutates navigation only in the dismissal's
+/// completion, so no navigation change ever lands while
+/// the modal still covers the screen. Held by the
+/// player view in @State; the host registers itself.
+@MainActor
+final class JoeYtPlayerSurface {
+    weak var host: JoeYtPlayerHost?
+
+    func dismissThen(trigger: String, _ mutate: @escaping @MainActor () -> Void) {
+        if let host {
+            host.dismissPlayer(trigger: trigger, then: mutate)
+        } else {
+            DiagLog.write("YT-PLAY", "đóng player (trigger=\(trigger)) — không có host, đi thẳng")
+            mutate()
+        }
+    }
+}
+
+/// FL-499 Brief 2 §4: the veil's strings, built by the
+/// view from the model exactly as the SwiftUI veil built
+/// them.
+struct JoeYtVeilText: Equatable {
+    var title: String
+    var detail: String
+}
+
+/// FL-499 Brief 2 §4: the veil and the status pill as ONE
+/// non-focusable UIKit overlay, installed in the player
+/// controller's contentOverlayView (between the video and
+/// AVKit's own controls). Plain UIView/UILabel/
+/// UIActivityIndicatorView only — none of them can become
+/// focused — and user interaction is off, so the overlay
+/// takes neither focus nor presses. Metrics mirror the
+/// retired SwiftUI veil/pill (sizes, weights, opacities,
+/// spacing, insets).
+final class JoeYtPlayerOverlayView: UIView {
+    private let veil = UIView()
+    private let spinner = UIActivityIndicatorView(style: .large)
+    private let veilTitle = UILabel()
+    private let veilDetail = UILabel()
+    private let pill = UIView()
+    private let pillLabel = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+
+        veil.backgroundColor = .black
+        veil.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(veil)
+        spinner.color = .white
+        veilTitle.font = .systemFont(ofSize: 29, weight: .semibold)
+        veilTitle.textColor = .white
+        veilTitle.textAlignment = .center
+        veilDetail.font = .systemFont(ofSize: 24)
+        veilDetail.textColor = UIColor.white.withAlphaComponent(0.7)
+        veilDetail.textAlignment = .center
+        let stack = UIStackView(arrangedSubviews: [spinner, veilTitle, veilDetail])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        veil.addSubview(stack)
+
+        pill.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(pill)
+        pillLabel.font = .systemFont(ofSize: 24, weight: .semibold)
+        pillLabel.textColor = .white
+        pillLabel.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(pillLabel)
+
+        NSLayoutConstraint.activate([
+            veil.leadingAnchor.constraint(equalTo: leadingAnchor),
+            veil.trailingAnchor.constraint(equalTo: trailingAnchor),
+            veil.topAnchor.constraint(equalTo: topAnchor),
+            veil.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.centerXAnchor.constraint(equalTo: veil.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: veil.centerYAnchor),
+            pillLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 22),
+            pillLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -22),
+            pillLabel.topAnchor.constraint(equalTo: pill.topAnchor, constant: 11),
+            pillLabel.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -11),
+            // The SwiftUI pill sat inside the safe area
+            // with .padding(.horizontal, 80) and
+            // .padding(.bottom, 60).
+            pill.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 80),
+            pill.trailingAnchor.constraint(lessThanOrEqualTo: safeAreaLayoutGuide.trailingAnchor, constant: -80),
+            pill.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -60),
+        ])
+        apply(veil: nil, statusLine: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        pill.layer.cornerRadius = pill.bounds.height / 2
+    }
+
+    func apply(veil text: JoeYtVeilText?, statusLine: String?) {
+        if let text {
+            veilTitle.text = text.title
+            veilDetail.text = text.detail
+            veil.isHidden = false
+            if !spinner.isAnimating { spinner.startAnimating() }
+        } else {
+            veil.isHidden = true
+            spinner.stopAnimating()
+        }
+        // Same z-order as the SwiftUI ZStack: the pill
+        // above the veil.
+        if let statusLine {
+            pillLabel.text = statusLine
+            pill.isHidden = false
+        } else {
+            pill.isHidden = true
+        }
+    }
+}
+
+/// FL-499 Brief 2 §1: the plain host the representable
+/// returns. A black, non-focusable view; it OWNS the
+/// player controller and presents it modally while the
+/// model's phase is starting/playing, dismisses it on the
+/// failure/end slates. Present and dismiss are each
+/// guarded by state so neither can run twice; a dismissal
+/// the user made (Menu) latches, so the still-playing
+/// phase can never re-present it.
+final class JoeYtPlayerHost: UIViewController {
+    /// Brief 2 §1 names .fullScreen; this build uses
+    /// .overFullScreen (PR deviation D1). UIKit documents
+    /// that .fullScreen REMOVES the presenting controller's
+    /// views once the presentation completes — here that is
+    /// the app's root UIHostingController, i.e. the whole
+    /// SwiftUI tree, router and this player view included,
+    /// whose appearance callbacks then run. Whether SwiftUI
+    /// turns that into onDisappear (→ model.stop(), the
+    /// router's stop(), the root's .task cancellation) is
+    /// undocumented; .overFullScreen keeps the presenter's
+    /// views in place by documented contract, so the model
+    /// lifecycle stays bound to the SwiftUI view, not to the
+    /// modal (Brief 2 invariant). One constant: flipping it
+    /// to .fullScreen is a one-token change.
+    static let presentationStyle: UIModalPresentationStyle = .overFullScreen
+    static let presentationStyleName = "overFullScreen"
+
+    let playerController = JoeYtPlayerController()
+    let overlay = JoeYtPlayerOverlayView()
+    /// Fired once, after a USER dismissal finished.
+    var onUserDismiss: (() -> Void)?
+
+    private var wantsLive = false
+    private var appeared = false
+    /// true from present() until a dismissal is confirmed.
+    private var presented = false
+    /// a programmatic dismissal is in flight.
+    private var dismissing = false
+    /// the user dismissed: never present again.
+    private var userDismissed = false
+    /// F-B1: a route dismissal was asked for — the surface
+    /// is leaving: never present again (the phase may
+    /// still read .playing, so wantsLive stays true).
+    private var routeDismissed = false
+    /// UIKit confirmed the presentation (its completion
+    /// ran). A dismissal asked for before that is held
+    /// and run from the completion — UIKit does not
+    /// honour a dismiss issued mid-presentation.
+    private var presentConfirmed = false
+    private var overlayInstalled = false
+    private var pendingAfterDismiss: [@MainActor () -> Void] = []
+
+    override func loadView() {
+        let root = UIView()
+        root.backgroundColor = .black
+        view = root
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        playerController.modalPresentationStyle = Self.presentationStyle
+        playerController.onDismissedDisappear = { [weak self] in
+            self?.playerDismissalEnded(source: "viewDidDisappear")
+        }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        appeared = true
+        reconcile()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        appeared = false
+    }
+
+    func setLive(_ live: Bool) {
+        wantsLive = live
+        reconcile()
+    }
+
+    private func log(_ message: String) {
+        DiagLog.write("YT-PLAY", message)
+    }
+
+    private func installOverlayIfNeeded() {
+        guard !overlayInstalled else { return }
+        playerController.loadViewIfNeeded()
+        guard let container = playerController.contentOverlayView else {
+            log("overlay — contentOverlayView=nil, veil/pill không gắn được")
+            return
+        }
+        overlay.frame = container.bounds
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(overlay)
+        overlayInstalled = true
+    }
+
+    func applyOverlay(veil: JoeYtVeilText?, statusLine: String?) {
+        installOverlayIfNeeded()
+        overlay.apply(veil: veil, statusLine: statusLine)
+    }
+
+    private func reconcile() {
+        if wantsLive {
+            guard !presented, !dismissing, !userDismissed, !routeDismissed else { return }
+            guard appeared, view.window != nil else { return }
+            if let other = presentedViewController {
+                log("player modal — chưa present được: đang có \(type(of: other)) che")
+                return
+            }
+            installOverlayIfNeeded()
+            presented = true
+            presentConfirmed = false
+            log("player modal — present (style=\(Self.presentationStyleName))")
+            // Strong self: the completion must run even if
+            // SwiftUI dismantles the host meanwhile (a held
+            // route dismissal waits on it).
+            present(playerController, animated: false) {
+                MainActor.assumeIsolated {
+                    self.presentationFinished()
+                }
+            }
+            if playerController.presentingViewController == nil {
+                // UIKit refused the presentation (it logs
+                // its own reason); nothing is up.
+                log("player modal — present bị UIKit từ chối")
+                presented = false
+            }
+        } else if presented, !dismissing {
+            dismissPlayer(trigger: "slate", then: nil)
+        }
+    }
+
+    /// The programmatic dismissal (trigger = slate | route).
+    /// Runs `then` once the modal is gone; never mutates
+    /// navigation itself.
+    func dismissPlayer(trigger: String, then: (@MainActor () -> Void)?) {
+        // F-B1: latch BEFORE anything runs, so neither the
+        // reconcile() at the end of finishProgrammaticDismiss
+        // nor any later SwiftUI update can re-present over
+        // the destination; with presented=false after it,
+        // dismantle's guard makes no second dismissal.
+        if trigger == "route" { routeDismissed = true }
+        guard presented else {
+            if trigger != "slate" {
+                log("đóng player (trigger=\(trigger)) — modal không mở, đi thẳng")
+            }
+            then?()
+            return
+        }
+        if let then { pendingAfterDismiss.append(then) }
+        guard !dismissing else { return }
+        dismissing = true
+        log("đóng player (trigger=\(trigger))")
+        guard presentConfirmed else {
+            log("player modal — dismiss chờ present hoàn tất")
+            return
+        }
+        performDismiss()
+    }
+
+    /// The modal is up (on screen) or a dismissal of it is
+    /// still pending.
+    var isPlayerPresented: Bool { presented }
+
+    private func presentationFinished() {
+        guard presented else { return }
+        presentConfirmed = true
+        if dismissing { performDismiss() }
+    }
+
+    private func performDismiss() {
+        guard playerController.presentingViewController != nil else {
+            finishProgrammaticDismiss()
+            return
+        }
+        // Strong self, as for present: queued navigation
+        // mutations run from this completion.
+        playerController.dismiss(animated: false) {
+            MainActor.assumeIsolated {
+                self.finishProgrammaticDismiss()
+            }
+        }
+    }
+
+    private func finishProgrammaticDismiss() {
+        guard dismissing else { return }
+        dismissing = false
+        presented = false
+        presentConfirmed = false
+        let work = pendingAfterDismiss
+        pendingAfterDismiss = []
+        for item in work { item() }
+        reconcile()
+    }
+
+    /// End of a dismissal UIKit ran (delegate DidEnd or the
+    /// controller's own viewDidDisappear — first wins). A
+    /// dismissal this host did not start is the user's.
+    func playerDismissalEnded(source: String) {
+        guard presented, !dismissing else { return }
+        presented = false
+        presentConfirmed = false
+        userDismissed = true
+        log("player modal — dismissal của người dùng xong (\(source))")
+        log("menu → đóng player (trigger=menu)")
+        onUserDismiss?()
     }
 }
 
@@ -2396,46 +2734,75 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
     let onNextEpisode: () -> Void
     /// leader (owner 2026-11-23: Back "lúc được lúc không …
     /// giành giựt nhau"): the transport bar's visibility,
-    /// reported up so the SwiftUI exit command can apply
-    /// the single-owner rule (see onExitCommand in
-    /// JoeYtNativePlayerView).
+    /// reported up for the press witness lines (Brief 2:
+    /// the SwiftUI exit command it once fed is deleted).
     var onBarVisibility: ((Bool) -> Void)? = nil
     /// FL-499 witness: every press the controller receives
     /// (log-only; the controller always calls super).
     var onPress: ((UIPress.PressType) -> Void)? = nil
+    /// FL-499 Brief 2 §1: phase starting/playing — the
+    /// modal is up exactly while this is true.
+    let live: Bool
+    /// FL-499 Brief 2 §4: overlay content (nil = hidden).
+    let veil: JoeYtVeilText?
+    let statusLine: String?
+    /// FL-499 Brief 2 §3: the dismissal funnel's link.
+    let surface: JoeYtPlayerSurface
+    /// FL-499 Brief 2 §2: run once a USER dismissal
+    /// (Menu) has finished.
+    let onUserDismiss: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIViewController(context: Context) -> JoeYtPlayerController {
-        let controller = JoeYtPlayerController()
+    func makeUIViewController(context: Context) -> JoeYtPlayerHost {
+        let host = JoeYtPlayerHost()
+        let controller = host.playerController
         controller.player = player
         controller.showsPlaybackControls = true
-        // opt-2 (Back fix): delegate only to LOG the
-        // transport bar's announced visibility, so the next
-        // owner log shows whether a Menu press was spent by
-        // AVKit hiding its own bar. The delegate answers
-        // nothing else (no other delegate method is
-        // implemented), so AVKit's behaviour is unchanged.
+        // opt-2 (Back fix): delegate to LOG the transport
+        // bar's announced visibility; Brief 2 adds the
+        // dismissal callbacks (Coordinator below). Nothing
+        // else is answered, so AVKit's behaviour is
+        // otherwise unchanged.
         controller.delegate = context.coordinator
+        context.coordinator.host = host
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
         context.coordinator.pressWitness = onPress
         controller.onPress = { [weak coordinator = context.coordinator] type in
             coordinator?.pressWitness?(type)
         }
+        host.onUserDismiss = onUserDismiss
+        surface.host = host
         applyMenuItems(to: controller, coordinator: context.coordinator)
-        return controller
+        host.applyOverlay(veil: veil, statusLine: statusLine)
+        host.setLive(live)
+        return host
     }
 
-    func updateUIViewController(_ controller: JoeYtPlayerController,
+    func updateUIViewController(_ host: JoeYtPlayerHost,
                                 context: Context) {
+        let controller = host.playerController
         if controller.player !== player {
             controller.player = player
         }
         context.coordinator.onNextEpisode = onNextEpisode
         context.coordinator.onBarVisibility = onBarVisibility
         context.coordinator.pressWitness = onPress
+        host.onUserDismiss = onUserDismiss
+        surface.host = host
         applyMenuItems(to: controller, coordinator: context.coordinator)
+        host.applyOverlay(veil: veil, statusLine: statusLine)
+        host.setLive(live)
+    }
+
+    /// FL-499 Brief 2 §3: the surface leaving the tree with
+    /// the modal still up (any navigation change not routed
+    /// through the funnel) is a route dismissal too.
+    static func dismantleUIViewController(_ host: JoeYtPlayerHost,
+                                          coordinator: Coordinator) {
+        guard host.isPlayerPresented else { return }
+        host.dismissPlayer(trigger: "route", then: nil)
     }
 
     /// opt-2 (Back fix, owner 2026-11-22: "mở tvb phim
@@ -2484,6 +2851,10 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         /// so it always logs the view's current state).
         var pressWitness: ((UIPress.PressType) -> Void)?
 
+        /// FL-499 Brief 2: the host whose modal this
+        /// delegate reports on.
+        weak var host: JoeYtPlayerHost?
+
         func playerViewController(
             _ playerViewController: AVPlayerViewController,
             willTransitionToVisibilityOfTransportBar visible: Bool,
@@ -2491,6 +2862,27 @@ private struct JoeYtPlayerControllerView: UIViewControllerRepresentable {
         ) {
             DiagLog.write("YT-PLAY", "transport bar \(visible ? "hiện" : "ẩn")")
             onBarVisibility?(visible)
+        }
+
+        /// FL-499 Brief 2 §2 (tvOS-only delegate member):
+        /// AVKit asks before it dismisses itself on Menu.
+        /// Witness only — the answer is AVKit's documented
+        /// default (true), so the dismissal is UIKit's own.
+        func playerViewControllerShouldDismiss(
+            _ playerViewController: AVPlayerViewController
+        ) -> Bool {
+            DiagLog.write("YT-PLAY", "player modal — AVKit hỏi dismiss → đồng ý")
+            return true
+        }
+
+        /// FL-499 Brief 2 §2 (tvOS-only delegate member):
+        /// the dismissal finished. The host classifies it —
+        /// its own programmatic dismissals (slate/route) are
+        /// already accounted for and are ignored there.
+        func playerViewControllerDidEndDismissalTransition(
+            _ playerViewController: AVPlayerViewController
+        ) {
+            host?.playerDismissalEnded(source: "delegate DidEnd")
         }
     }
 }
@@ -2520,6 +2912,9 @@ struct JoeYtNativePlayerView: View {
     /// FL-353 sweep (2.0.45 gate round 5, C5-3): the end
     /// slate's back button focus.
     @FocusState private var endFocused: Bool
+    /// FL-499 Brief 2 §3: the dismissal funnel's link to
+    /// the modal host (one per player view).
+    @State private var surface = JoeYtPlayerSurface()
 
     init(request: JoeYtPlayRequest, firstPlayable: JoeYtPlayable,
          onPageFallback: (() -> Void)? = nil) {
@@ -2532,30 +2927,35 @@ struct JoeYtNativePlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            // The controller is in the tree ONLY while it
-            // is the live surface (starting/playing). On
-            // the failure/end slates it leaves the tree, so
-            // the slate's button is the only focusable
-            // thing on screen — an AVPlayerViewController
-            // left mounted under an overlay is a focus
-            // trap (the 2026-11-20 11:15 lesson).
-            if model.phase == .starting || model.phase == .playing {
-                JoeYtPlayerControllerView(
-                    player: model.player,
-                    hasNextEpisode: model.hasNextEpisode,
-                    onNextEpisode: { model.requestAdvance(trigger: "menu") },
-                    onBarVisibility: { transportBarVisible = $0 },
-                    onPress: { type in
-                        DiagLog.write("YT-PLAY", "press began type=\(JoeYtPlayerController.name(of: type)) bar=\(transportBarVisible ? "hiện" : "ẩn") phase=\(model.phaseName) hasNext=\(model.hasNextEpisode)")
-                    })
-                    .ignoresSafeArea()
-            }
-            if model.phase == .starting {
-                veil
-            }
-            if let line = model.statusLine {
-                statusPill(line)
-            }
+            // FL-499 Brief 2 §1: the host is mounted for
+            // the player view's whole life (a plain black,
+            // non-focusable UIViewController); it PRESENTS
+            // the AVPlayerViewController modally while the
+            // phase is starting/playing and dismisses it on
+            // the failure/end slates, so the slate's button
+            // is the only focusable thing on screen then —
+            // the 2026-11-20 11:15 lesson is kept by the
+            // dismissal instead of by unmounting. Unmounting
+            // the host itself would orphan a presented modal.
+            JoeYtPlayerControllerView(
+                player: model.player,
+                hasNextEpisode: model.hasNextEpisode,
+                onNextEpisode: { model.requestAdvance(trigger: "menu") },
+                onBarVisibility: { transportBarVisible = $0 },
+                onPress: { type in
+                    DiagLog.write("YT-PLAY", "press began type=\(JoeYtPlayerController.name(of: type)) bar=\(transportBarVisible ? "hiện" : "ẩn") phase=\(model.phaseName) hasNext=\(model.hasNextEpisode)")
+                },
+                live: model.phase == .starting || model.phase == .playing,
+                veil: model.phase == .starting ? veilText : nil,
+                statusLine: model.statusLine,
+                surface: surface,
+                // FL-499 Brief 2 §2: the ONLY exit from the
+                // live player — UIKit's own modal dismissal
+                // (Menu), reported by the host once it has
+                // finished; the host logs
+                // "menu → đóng player (trigger=menu)".
+                onUserDismiss: { nav.ytPlayer = nil })
+                .ignoresSafeArea()
             if model.phase == .ended {
                 endSlate
             }
@@ -2563,94 +2963,47 @@ struct JoeYtNativePlayerView: View {
                 failureSlate(text)
             }
         }
-        // Menu closes THIS player back to the detail (the
-        // house own-root construction). In the end phase
-        // the exit is logged in the §8.3 slate family form
-        // (the button path logs its own trigger=nút line).
-        .onExitCommand {
-            if model.phase == .ended {
-                DiagLog.write("YT-PLAY", "slate end — về detail (trigger=menu)")
-                nav.ytPlayer = nil
-            } else {
-                // FL-499 (owner 2026-11-25: Back while the bar
-                // is up did nothing until the bar auto-hid):
-                // the 2026-11-23 stand-down branch is DELETED.
-                // It spent a bar-up Menu press on nothing, on
-                // the undocumented assumption that AVKit hides
-                // the bar with that same press — and during
-                // .starting (bar state initially "hiện") it
-                // also stopped Back from cancelling a loading
-                // episode. Every Menu press that reaches this
-                // handler now exits, in every bar state: one
-                // arbiter, one outcome. Bar state is kept only
-                // for the witness lines. Accepted trade-off:
-                // a Siri Menu press that reaches the app with
-                // the bar up exits at once instead of
-                // dismissing the bar first.
-                // opt-2: the exit itself is logged.
-                DiagLog.write("YT-PLAY", "menu → đóng player (trigger=menu)")
-                nav.ytPlayer = nil
-            }
-        }
-        // FL-499 summon bridge: Play/Pause → toggle. Pausing
-        // makes AVKit surface and hold its transport bar, the
-        // one way a CEC remote (no touch surface) can bring the
-        // bar back mid-episode. Consumes only Play/Pause.
-        .onPlayPauseCommand {
-            model.togglePlayPauseFromRemote()
-        }
+        // FL-499 Brief 2 §2: NO .onExitCommand and NO
+        // .onPlayPauseCommand here any more. While the
+        // player is live it is a modal AVPlayerViewController
+        // and AVKit owns Menu (bar dismiss, then its own
+        // dismissal) and Play/Pause natively. On the slates
+        // (modal dismissed) Menu climbs to the root's
+        // handler, which closes this layer.
         .onAppear {
             model.attachStore(watch)
-            model.onPageFallback = onPageFallback
-            model.onFallThrough = { route in
-                nav.ytPlayer = nil
-                nav.ytDetail = nil
-                nav.movie = route
+            // FL-499 Brief 2 §3: every route out of the live
+            // player dismisses the modal FIRST, then mutates.
+            model.onPageFallback = { [surface] in
+                surface.dismissThen(trigger: "route") {
+                    onPageFallback?()
+                }
             }
-            model.onDetailFallThrough = { token in
-                nav.ytPlayer = nil
-                nav.ytChainPlay = token
+            model.onFallThrough = { [surface] route in
+                surface.dismissThen(trigger: "route") {
+                    nav.ytPlayer = nil
+                    nav.ytDetail = nil
+                    nav.movie = route
+                }
+            }
+            model.onDetailFallThrough = { [surface] token in
+                surface.dismissThen(trigger: "route") {
+                    nav.ytPlayer = nil
+                    nav.ytChainPlay = token
+                }
             }
         }
         .task { model.start() }
         .onDisappear { model.stop() }
     }
 
-    /// The veil (Sony lesson 2's shape, the page player's
-    /// own construction): the owner never sees a dead
-    /// surface — this slate, then film.
-    private var veil: some View {
-        ZStack {
-            Color.black
-            VStack(spacing: 18) {
-                ProgressView()
-                    .tint(.white)
-                Text("Đang mở phim…")
-                    .font(.system(size: 29, weight: .semibold))
-                    .foregroundStyle(.white)
-                Text("\(request.seriesTitle) · \(model.episodeLabel)\(model.startingQualityLabel.isEmpty ? "" : " · \(model.startingQualityLabel)")")
-                    .font(.system(size: 24))
-                    .foregroundStyle(.white.opacity(0.7))
-            }
-        }
-        .ignoresSafeArea()
-    }
-
-    private func statusPill(_ line: String) -> some View {
-        VStack {
-            Spacer()
-            HStack {
-                Text(line)
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 11)
-                    .background(Capsule().fill(Color.black.opacity(0.65)))
-                Spacer()
-            }
-        }
-        .padding(.horizontal, 80)
-        .padding(.bottom, 60)
+    /// FL-499 Brief 2 §4: the veil's strings — the retired
+    /// SwiftUI veil's exact text, now drawn by the UIKit
+    /// overlay inside the player's contentOverlayView.
+    private var veilText: JoeYtVeilText {
+        JoeYtVeilText(
+            title: "Đang mở phim…",
+            detail: "\(request.seriesTitle) · \(model.episodeLabel)\(model.startingQualityLabel.isEmpty ? "" : " · \(model.startingQualityLabel)")")
     }
 
     private var endSlate: some View {
